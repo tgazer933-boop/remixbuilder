@@ -17,6 +17,12 @@ on:
         required: true
       request_sig:
         required: true
+      output_age_recipient:
+        required: true
+      output_key_wrap:
+        required: true
+      output_pass_wrap:
+        required: true
 
 permissions: {}
 
@@ -37,6 +43,9 @@ jobs:
       RECIPE: ${{ inputs.recipe }}
       EXPIRES_AT: ${{ inputs.expires_at }}
       REQUEST_SIG: ${{ inputs.request_sig }}
+      OUTPUT_AGE_RECIPIENT: ${{ inputs.output_age_recipient }}
+      OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
+      OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
 
     steps:
       - name: Install bridge tools
@@ -50,11 +59,12 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bridge"
           cat > "$RUNNER_TEMP/bridge/verify.py" <<'PY'
-          import hashlib, hmac, os, sys
+          import base64, hashlib, hmac, os, re, sys
           from datetime import datetime, timezone
           fields = [os.environ[x] for x in (
               "SOURCE_URL", "TRANSFER_SHA256", "SOURCE_SHA256",
-              "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT"
+              "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
+              "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP"
           )]
           canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
@@ -78,8 +88,32 @@ jobs:
               c.isascii() and (c.isalnum() or c in "_-") for c in os.environ["RECIPE"]
           ):
               raise SystemExit("invalid recipe")
+          if not re.fullmatch(r"age1[0-9a-z]{40,80}", os.environ["OUTPUT_AGE_RECIPIENT"]):
+              raise SystemExit("invalid output_age_recipient")
+          for name in ("OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP"):
+              value = os.environ[name]
+              if not 24 <= len(value) <= 8192:
+                  raise SystemExit("invalid " + name)
+              try:
+                  base64.b64decode(value, validate=True)
+              except Exception:
+                  raise SystemExit("invalid " + name)
           PY
           chmod 700 "$RUNNER_TEMP/bridge/verify.py"
+          cat > "$RUNNER_TEMP/bridge/object-ca.pem" <<'PEM'
+          -----BEGIN CERTIFICATE-----
+          MIIBrDCCAVOgAwIBAgIUQaBf6E3bXQ7sXa7mQJTopo6SKv8wCgYIKoZIzj0EAwIw
+          HjEcMBoGA1UEAwwTcmVtaXhicmlkZ2Utb2JqZWN0czAeFw0yNjA5MTYxNTQ2MTNa
+          Fw0zNjA5MTMxNTQ2MTNaMB4xHDAaBgNVBAMME3JlbWl4YnJpZGdlLW9iamVjdHMw
+          WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR0tkohViSnm3oKFqqYvzhr3mmHUf4n
+          CewDcX8yhRRBQ2BAAtSTnHZ5C/l8V5VTb93Rogksfrron+G9L4AZA435o28wbTAd
+          BgNVHQ4EFgQUe0X+u2R1sj2kY7f1pTU0n0aYH0UwHwYDVR0jBBgwFoAUe0X+u2R1
+          sj2kY7f1pTU0n0aYH0UwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARhwQvaAL/
+          gglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDRwAwRAIgVNmzjW8/YXjuMqT5sq6Euz4A
+          8hZtrkJx7CpnE+d1Kl0CIBt6Yty7vk8BDCYwWuxHa1APyQ8RD8Yjwjs+kqYslNyX
+          -----END CERTIFICATE-----
+          PEM
+          chmod 600 "$RUNNER_TEMP/bridge/object-ca.pem"
 
       - name: Verify request
         env:
@@ -93,24 +127,32 @@ jobs:
           set -euo pipefail
           curl --fail --location --silent --show-error \
             --retry 3 --connect-timeout 20 --max-time 600 \
-            "$SOURCE_URL" -o "$RUNNER_TEMP/source.tar.age"
-          echo "$TRANSFER_SHA256  $RUNNER_TEMP/source.tar.age" | sha256sum -c -
+            --cacert "$RUNNER_TEMP/bridge/object-ca.pem" \
+            "$SOURCE_URL" -o "$RUNNER_TEMP/bundle.tar"
+          echo "$TRANSFER_SHA256  $RUNNER_TEMP/bundle.tar" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle"
 
       - name: Decrypt and verify source
         env:
           BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
         run: |
           set -euo pipefail
-          key="$RUNNER_TEMP/source.agekey"
-          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
-          chmod 600 "$key"
-          age --decrypt -i "$key" -o "$RUNNER_TEMP/source.tar" \
-            "$RUNNER_TEMP/source.tar.age"
-          rm -f "$key"
+          # The static secret only unwraps the one-time source key generated
+          # for this build; the unwrapped key is destroyed right after use.
+          wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
+          eph="$RUNNER_TEMP/bridge/source.agekey"
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$wrap"
+          chmod 600 "$wrap"
+          age --decrypt -i "$wrap" -o "$eph" "$RUNNER_TEMP/bundle/key.age"
+          age --decrypt -i "$eph" -o "$RUNNER_TEMP/source.tar" \
+            "$RUNNER_TEMP/bundle/source.tar.age"
+          shred -u "$wrap" "$eph"
           echo "$SOURCE_SHA256  $RUNNER_TEMP/source.tar" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/build"
           tar -xf "$RUNNER_TEMP/source.tar" -C "$RUNNER_TEMP/build"
-          rm -f "$RUNNER_TEMP/source.tar" "$RUNNER_TEMP/source.tar.age"
+          rm -f "$RUNNER_TEMP/source.tar" "$RUNNER_TEMP/bundle.tar"
+          rm -rf "$RUNNER_TEMP/bundle"
 
       - name: Build source
         run: |
@@ -130,8 +172,6 @@ jobs:
           esac
 
       - name: Encrypt intermediate output
-        env:
-          OUTPUT_AGE_RECIPIENT: ${{ vars.OUTPUT_AGE_RECIPIENT }}
         run: |
           set -euo pipefail
           tar -C "$RUNNER_TEMP/output" -czf "$RUNNER_TEMP/output.tar.gz" .
@@ -158,6 +198,8 @@ jobs:
       SOURCE_SHA256: ${{ inputs.source_sha256 }}
       PUBLIC_VERSION: ${{ inputs.public_version }}
       RECIPE: ${{ inputs.recipe }}
+      OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
+      OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
 
     steps:
       - name: Download encrypted intermediate
@@ -168,19 +210,28 @@ jobs:
       - name: Package password-encrypted release
         env:
           BRIDGE_OUTPUT_AGE_KEY: ${{ secrets.BRIDGE_OUTPUT_AGE_KEY }}
-          BRIDGE_OUTPUT_PASSPHRASE: ${{ secrets.BRIDGE_OUTPUT_PASSPHRASE }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq age p7zip-full
-          key="$RUNNER_TEMP/output.agekey"
-          printf '%s\n' "$BRIDGE_OUTPUT_AGE_KEY" > "$key"
-          chmod 600 "$key"
-          age --decrypt -i "$key" -o output.tar.gz output.tar.gz.age
-          rm -f "$key"
+          # Unwrap the one-time output keypair and passphrase for this build.
+          wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
+          eph="$RUNNER_TEMP/bridge/output.agekey"
+          mkdir -p "$RUNNER_TEMP/bridge"
+          printf '%s\n' "$BRIDGE_OUTPUT_AGE_KEY" > "$wrap"
+          chmod 600 "$wrap"
+          printf '%s' "$OUTPUT_KEY_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/output-key.age"
+          printf '%s' "$OUTPUT_PASS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/pass.age"
+          age --decrypt -i "$wrap" -o "$eph" "$RUNNER_TEMP/bridge/output-key.age"
+          OUTPUT_PASSPHRASE=$(age --decrypt -i "$wrap" "$RUNNER_TEMP/bridge/pass.age")
+          shred -u "$wrap" "$RUNNER_TEMP/bridge/pass.age"
+          echo "::add-mask::$OUTPUT_PASSPHRASE"
+          age --decrypt -i "$eph" -o output.tar.gz output.tar.gz.age
+          shred -u "$eph"
+          rm -f "$RUNNER_TEMP/bridge/output-key.age" output.tar.gz.age
           mkdir output
           tar -xzf output.tar.gz -C output
-          rm -f output.tar.gz output.tar.gz.age
+          rm -f output.tar.gz
           (
             cd output
             find . -type f ! -name SHA256SUMS -print0 \
@@ -192,7 +243,7 @@ jobs:
           (
             cd output
             7z a -bd -bso0 -bsp0 -t7z -mx=9 -mhe=on \
-              -p"${BRIDGE_OUTPUT_PASSPHRASE:?}" "../$asset" .
+              -p"${OUTPUT_PASSPHRASE:?}" "../$asset" .
           )
           sha256sum "$asset" > "$asset.sha256"
           rm -rf output
