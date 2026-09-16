@@ -18,7 +18,8 @@ This repository contains no project source. It only contains the trusted GitHub 
   - the final 7z passphrase is random per build, wrapped to the output wrap key, and delivered as ciphertext through public dispatch inputs.
 - qdvps persists no static age private keys. It holds only the two wrap public keys; the corresponding private keys exist solely as GitHub Secrets and are used only to unwrap per-build keys.
 - The object server is TLS-only (`https://47.104.2.255:3001`). The runner pins the server through the self-signed certificate embedded in the workflow; plain HTTP is refused.
-- The encrypted source URL is signed and expires in 20 minutes; successful download consumes the object.
+- Builds run on a Linux, macOS and Windows runner matrix; each leg encrypts its output separately and publish merges them into `linux/`, `macos/`, `windows/` directories of one release.
+- One one-time object per runner OS is uploaded for every submission (three signed, expiring URLs); each matrix leg downloads exactly its own object, preserving strict single-use semantics.
 - The whole dispatch request — URL, hashes, version, recipe, and the three one-time-key ciphertexts — is HMAC-signed; the runner rejects anything unsigned.
 - GitHub runner decrypts the source only after signature and hash verification, and destroys one-time keys immediately after use.
 - Publish job creates a 7z AES-256 archive with encrypted headers and the per-build passphrase.
@@ -33,6 +34,9 @@ Any Gitea repository can use the bridge by including an executable:
 ```text
 .bridge/build.sh
 ```
+
+The script must be bash-compatible (Git Bash on the Windows leg) and runs on
+all three runner OSes; detect the host with `uname -s` when needed.
 
 The script receives:
 
