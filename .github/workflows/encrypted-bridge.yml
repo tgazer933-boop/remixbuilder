@@ -32,7 +32,11 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions: {}
     env:
@@ -49,12 +53,32 @@ jobs:
 
     steps:
       - name: Install bridge tools
+        shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq age p7zip-full python3
+          case "${RUNNER_OS:?}" in
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq age
+              ;;
+            macOS)
+              brew install age
+              ;;
+            Windows)
+              if ! choco install -y --no-progress age; then
+                curl -fsSL -o "$RUNNER_TEMP/age.zip" \
+                  "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
+                tar -xf "$RUNNER_TEMP/age.zip" -C "$RUNNER_TEMP"
+                echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+                export PATH="$RUNNER_TEMP/age:$PATH"
+              fi
+              age --version
+              ;;
+          esac
+          age --version
 
       - name: Prepare trusted bridge scripts
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bridge"
@@ -116,24 +140,36 @@ jobs:
           chmod 600 "$RUNNER_TEMP/bridge/object-ca.pem"
 
       - name: Verify request
+        shell: bash
         env:
           BRIDGE_SIGNING_KEY: ${{ secrets.BRIDGE_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          python3 "$RUNNER_TEMP/bridge/verify.py"
+          PY=$(command -v python3 || command -v python)
+          "$PY" "$RUNNER_TEMP/bridge/verify.py"
 
       - name: Download encrypted source
+        shell: bash
         run: |
           set -euo pipefail
           curl --fail --location --silent --show-error \
             --retry 3 --connect-timeout 20 --max-time 600 \
             --cacert "$RUNNER_TEMP/bridge/object-ca.pem" \
             "$SOURCE_URL" -o "$RUNNER_TEMP/bundle.tar"
-          echo "$TRANSFER_SHA256  $RUNNER_TEMP/bundle.tar" | sha256sum -c -
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          [[ "$(hash_file "$RUNNER_TEMP/bundle.tar")" == "$TRANSFER_SHA256" ]] \
+            || { echo "transfer sha256 mismatch" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/bundle"
           tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle"
 
       - name: Decrypt and verify source
+        shell: bash
         env:
           BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
         run: |
@@ -147,14 +183,23 @@ jobs:
           age --decrypt -i "$wrap" -o "$eph" "$RUNNER_TEMP/bundle/key.age"
           age --decrypt -i "$eph" -o "$RUNNER_TEMP/source.tar" \
             "$RUNNER_TEMP/bundle/source.tar.age"
-          shred -u "$wrap" "$eph"
-          echo "$SOURCE_SHA256  $RUNNER_TEMP/source.tar" | sha256sum -c -
+          shred -u "$wrap" "$eph" 2>/dev/null || rm -f "$wrap" "$eph"
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          [[ "$(hash_file "$RUNNER_TEMP/source.tar")" == "$SOURCE_SHA256" ]] \
+            || { echo "source sha256 mismatch" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/build"
           tar -xf "$RUNNER_TEMP/source.tar" -C "$RUNNER_TEMP/build"
           rm -f "$RUNNER_TEMP/source.tar" "$RUNNER_TEMP/bundle.tar"
           rm -rf "$RUNNER_TEMP/bundle"
 
       - name: Build source
+        shell: bash
         run: |
           set -euo pipefail
           export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/output"
@@ -162,8 +207,8 @@ jobs:
           cd "$RUNNER_TEMP/build/src"
           case "$RECIPE" in
             shell)
-              test -x .bridge/build.sh
-              ./.bridge/build.sh
+              test -f .bridge/build.sh
+              bash ./.bridge/build.sh
               ;;
             *)
               echo "Unsupported recipe: $RECIPE" >&2
@@ -172,18 +217,20 @@ jobs:
           esac
 
       - name: Encrypt intermediate output
+        shell: bash
         run: |
           set -euo pipefail
           tar -C "$RUNNER_TEMP/output" -czf "$RUNNER_TEMP/output.tar.gz" .
-          age -r "$OUTPUT_AGE_RECIPIENT" -o "$RUNNER_TEMP/output.tar.gz.age" \
+          age -r "$OUTPUT_AGE_RECIPIENT" \
+            -o "$RUNNER_TEMP/output-${RUNNER_OS}.tar.gz.age" \
             "$RUNNER_TEMP/output.tar.gz"
           rm -rf "$RUNNER_TEMP/output" "$RUNNER_TEMP/output.tar.gz"
 
       - name: Upload encrypted intermediate
         uses: actions/upload-artifact@v7
         with:
-          name: encrypted-output
-          path: ${{ runner.temp }}/output.tar.gz.age
+          name: encrypted-output-${{ runner.os }}
+          path: ${{ runner.temp }}/output-${{ runner.os }}.tar.gz.age
           retention-days: 1
           if-no-files-found: error
 
@@ -202,10 +249,20 @@ jobs:
       OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
 
     steps:
-      - name: Download encrypted intermediate
+      - name: Download encrypted intermediate (Linux)
         uses: actions/download-artifact@v7
         with:
-          name: encrypted-output
+          name: encrypted-output-Linux
+
+      - name: Download encrypted intermediate (macOS)
+        uses: actions/download-artifact@v7
+        with:
+          name: encrypted-output-macOS
+
+      - name: Download encrypted intermediate (Windows)
+        uses: actions/download-artifact@v7
+        with:
+          name: encrypted-output-Windows
 
       - name: Package password-encrypted release
         env:
@@ -226,12 +283,16 @@ jobs:
           OUTPUT_PASSPHRASE=$(age --decrypt -i "$wrap" "$RUNNER_TEMP/bridge/pass.age")
           shred -u "$wrap" "$RUNNER_TEMP/bridge/pass.age"
           echo "::add-mask::$OUTPUT_PASSPHRASE"
-          age --decrypt -i "$eph" -o output.tar.gz output.tar.gz.age
-          shred -u "$eph"
-          rm -f "$RUNNER_TEMP/bridge/output-key.age" output.tar.gz.age
           mkdir output
-          tar -xzf output.tar.gz -C output
-          rm -f output.tar.gz
+          for os in Linux macOS Windows; do
+            slug=$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')
+            age --decrypt -i "$eph" -o "output-$os.tar.gz" "output-$os.tar.gz.age"
+            mkdir "output/$slug"
+            tar -xzf "output-$os.tar.gz" -C "output/$slug"
+            rm -f "output-$os.tar.gz" "output-$os.tar.gz.age"
+          done
+          shred -u "$eph"
+          rm -f "$RUNNER_TEMP/bridge/output-key.age"
           (
             cd output
             find . -type f ! -name SHA256SUMS -print0 \
