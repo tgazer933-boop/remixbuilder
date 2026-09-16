@@ -3,7 +3,11 @@ name: encrypted-build-bridge
 on:
   workflow_dispatch:
     inputs:
-      source_url:
+      source_url_linux:
+        required: true
+      source_url_macos:
+        required: true
+      source_url_windows:
         required: true
       transfer_sha256:
         required: true
@@ -40,7 +44,10 @@ jobs:
     timeout-minutes: 60
     permissions: {}
     env:
-      SOURCE_URL: ${{ inputs.source_url }}
+      SOURCE_URL: ${{ runner.os == 'Linux' && inputs.source_url_linux || (runner.os == 'macOS' && inputs.source_url_macos || inputs.source_url_windows) }}
+      SOURCE_URL_LINUX: ${{ inputs.source_url_linux }}
+      SOURCE_URL_MACOS: ${{ inputs.source_url_macos }}
+      SOURCE_URL_WINDOWS: ${{ inputs.source_url_windows }}
       TRANSFER_SHA256: ${{ inputs.transfer_sha256 }}
       SOURCE_SHA256: ${{ inputs.source_sha256 }}
       PUBLIC_VERSION: ${{ inputs.public_version }}
@@ -65,13 +72,11 @@ jobs:
               brew install age
               ;;
             Windows)
-              if ! choco install -y --no-progress age; then
-                curl -fsSL -o "$RUNNER_TEMP/age.zip" \
-                  "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
-                tar -xf "$RUNNER_TEMP/age.zip" -C "$RUNNER_TEMP"
-                echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
-                export PATH="$RUNNER_TEMP/age:$PATH"
-              fi
+              curl -fsSL -o "$RUNNER_TEMP/age.zip" \
+                "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
+              (cd "$RUNNER_TEMP" && tar -xf age.zip)
+              echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+              export PATH="$RUNNER_TEMP/age:$PATH"
               age --version
               ;;
           esac
@@ -86,7 +91,8 @@ jobs:
           import base64, hashlib, hmac, os, re, sys
           from datetime import datetime, timezone
           fields = [os.environ[x] for x in (
-              "SOURCE_URL", "TRANSFER_SHA256", "SOURCE_SHA256",
+              "SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS",
+              "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP"
           )]
@@ -98,6 +104,9 @@ jobs:
           supplied = os.environ["REQUEST_SIG"].lower()
           if not hmac.compare_digest(expected, supplied):
               raise SystemExit("invalid request signature")
+          for name in ("SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS"):
+              if not os.environ[name].startswith("https://47.104.2.255:3001/objects/"):
+                  raise SystemExit("invalid " + name)
           exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
           if datetime.now(timezone.utc) >= exp:
               raise SystemExit("request expired")
@@ -166,7 +175,7 @@ jobs:
           [[ "$(hash_file "$RUNNER_TEMP/bundle.tar")" == "$TRANSFER_SHA256" ]] \
             || { echo "transfer sha256 mismatch" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/bundle"
-          tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle"
+          (cd "$RUNNER_TEMP" && tar -xf bundle.tar -C bundle)
 
       - name: Decrypt and verify source
         shell: bash
@@ -194,7 +203,7 @@ jobs:
           [[ "$(hash_file "$RUNNER_TEMP/source.tar")" == "$SOURCE_SHA256" ]] \
             || { echo "source sha256 mismatch" >&2; exit 1; }
           mkdir -p "$RUNNER_TEMP/build"
-          tar -xf "$RUNNER_TEMP/source.tar" -C "$RUNNER_TEMP/build"
+          (cd "$RUNNER_TEMP" && tar -xf source.tar -C build)
           rm -f "$RUNNER_TEMP/source.tar" "$RUNNER_TEMP/bundle.tar"
           rm -rf "$RUNNER_TEMP/bundle"
 
@@ -220,7 +229,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -C "$RUNNER_TEMP/output" -czf "$RUNNER_TEMP/output.tar.gz" .
+          (cd "$RUNNER_TEMP" && tar -C output -czf output.tar.gz .)
           age -r "$OUTPUT_AGE_RECIPIENT" \
             -o "$RUNNER_TEMP/output-${RUNNER_OS}.tar.gz.age" \
             "$RUNNER_TEMP/output.tar.gz"
