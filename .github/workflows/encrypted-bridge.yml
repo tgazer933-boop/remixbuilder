@@ -44,7 +44,6 @@ jobs:
     timeout-minutes: 60
     permissions: {}
     env:
-      SOURCE_URL: ${{ runner.os == 'Linux' && inputs.source_url_linux || (runner.os == 'macOS' && inputs.source_url_macos || inputs.source_url_windows) }}
       SOURCE_URL_LINUX: ${{ inputs.source_url_linux }}
       SOURCE_URL_MACOS: ${{ inputs.source_url_macos }}
       SOURCE_URL_WINDOWS: ${{ inputs.source_url_windows }}
@@ -159,6 +158,8 @@ jobs:
 
       - name: Download encrypted source
         shell: bash
+        env:
+          SOURCE_URL: ${{ runner.os == 'Linux' && inputs.source_url_linux || (runner.os == 'macOS' && inputs.source_url_macos || inputs.source_url_windows) }}
         run: |
           set -euo pipefail
           curl --fail --location --silent --show-error \
