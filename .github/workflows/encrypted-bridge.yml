@@ -71,9 +71,9 @@ jobs:
               brew install age
               ;;
             Windows)
-              curl -fsSL -o "$RUNNER_TEMP/age.zip" \
+              curl -fsSL --retry 3 -o "$RUNNER_TEMP/age.zip" \
                 "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
-              (cd "$RUNNER_TEMP" && tar -xf age.zip)
+              (cd "$RUNNER_TEMP" && /c/Windows/System32/tar.exe -xf age.zip)
               echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
               export PATH="$RUNNER_TEMP/age:$PATH"
               age --version
