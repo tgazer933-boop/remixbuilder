@@ -162,21 +162,20 @@ jobs:
           SOURCE_URL: ${{ runner.os == 'Linux' && inputs.source_url_linux || (runner.os == 'macOS' && inputs.source_url_macos || inputs.source_url_windows) }}
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"
           curl --fail --location --silent --show-error \
             --retry 3 --connect-timeout 20 --max-time 600 \
-            --cacert "$RUNNER_TEMP/bridge/object-ca.pem" \
-            "$SOURCE_URL" -o "$RUNNER_TEMP/bundle.tar"
-          hash_file() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$1" | awk '{print $1}'
-            else
-              shasum -a 256 "$1" | awk '{print $1}'
-            fi
-          }
-          [[ "$(hash_file "$RUNNER_TEMP/bundle.tar")" == "$TRANSFER_SHA256" ]] \
-            || { echo "transfer sha256 mismatch" >&2; exit 1; }
-          mkdir -p "$RUNNER_TEMP/bundle"
-          (cd "$RUNNER_TEMP" && tar -xf bundle.tar -C bundle)
+            --cacert bridge/object-ca.pem \
+            "$SOURCE_URL" -o bundle.tar
+          actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum bundle.tar | awk '{print $1}'; else shasum -a 256 bundle.tar | awk '{print $1}'; fi)
+          echo "downloaded $(wc -c < bundle.tar) bytes, sha256=$actual expected=$TRANSFER_SHA256"
+          if [[ "$actual" != "$TRANSFER_SHA256" ]]; then
+            head -c 64 bundle.tar | od -An -c | head -3
+            echo "transfer sha256 mismatch" >&2
+            exit 1
+          fi
+          mkdir -p bundle
+          tar -xf bundle.tar -C bundle
 
       - name: Decrypt and verify source
         shell: bash
