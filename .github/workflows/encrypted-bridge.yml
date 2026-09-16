@@ -56,7 +56,7 @@ jobs:
               "SOURCE_URL", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT"
           )]
-          canonical = "v1\n" + "\n".join(fields) + "\n"
+          canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
               os.environ["BRIDGE_SIGNING_KEY"].encode(),
               canonical.encode(), hashlib.sha256
