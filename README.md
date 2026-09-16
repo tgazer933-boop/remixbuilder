@@ -23,6 +23,7 @@ This repository contains no project source. It only contains the trusted GitHub 
 - GitHub runner decrypts the source only after signature and hash verification, and destroys one-time keys immediately after use.
 - Publish job creates a 7z AES-256 archive with encrypted headers and the per-build passphrase.
 - qdvps retrieves the release over `api.github.com`, verifies the asset SHA-256, decrypts it with the one-time passphrase held only until that retrieval, and checks `SHA256SUMS`. The passphrase file is destroyed on successful fetch; a second fetch of the same version is refused.
+- Immediately after a fully successful retrieval, the encrypted release (assets included) and its tag are deleted from GitHub, so published ciphertext never accumulates.
 
 ## Generic source contract
 
