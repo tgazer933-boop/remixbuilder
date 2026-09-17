@@ -69,6 +69,14 @@ Fetch and decrypt (the one-time passphrase is generated at submit time and consu
   /tmp/output
 ```
 
+## Known limitations (measured, 2026-09 reliability round)
+
+- **No git metadata on runners.** Source arrives as a `git archive` tarball: `git describe`, `git submodule`, and any `.git`-dependent logic do not work inside `.bridge/build.sh`. Tag versions must be passed some other way (e.g. written to a file before submitting).
+- **Symlinks become plain files on the Windows leg.** Linux/macOS preserve symlinks; Git Bash tar materializes them as regular copies (content intact, `test -L` false). Builds that depend on symlink semantics see a 1.8 MB-different world on Windows (measured: 3 symlinks → 3 extra regular files on a 10561-file tree).
+- **Large trees are bounded by the transfer window.** A 159 MB source tar moved through the whole pipeline (upload 9 s on qdvps; runner download + decrypt + 10561-file extraction succeeded on all three OSes within the 20-minute object expiry). Treat ~hundreds of MB as the practical ceiling; repo-level artifacts beyond that risk the expiry window on slow trans-border links.
+- **Cross-border release downloads can stall.** `bridge-fetch.sh` resumes (`-C -`) with up to 8 attempts; a 16 MB asset typically completes in one or two attempts.
+- **Failing builds leave a pending one-time passphrase** on qdvps that is never fetched (swept after 14 days) and no release is published.
+
 ## Important boundary
 
 GitHub runners must process plaintext source and plaintext intermediate output while building. Encryption protects transfer, storage, and published artifacts; it does not make GitHub an invisible execution environment.
