@@ -411,7 +411,12 @@ jobs:
               ;;
             actions)
               PY=$(command -v python3 || command -v python)
-              "$PY" -m pip install --user --quiet pyyaml 2>/dev/null || "$PY" -m pip install --quiet pyyaml 2>/dev/null || true
+              if ! "$PY" -c "import yaml" 2>/dev/null; then
+                "$PY" -m pip install --quiet --break-system-packages pyyaml \
+                  || "$PY" -m pip install --quiet pyyaml \
+                  || "$PY" -m pip install --quiet --user pyyaml
+              fi
+              "$PY" -c "import yaml" || { echo "pyyaml unavailable on this leg" >&2; exit 1; }
               export BRIDGE_SRC="$PWD"
               "$PY" "$RUNNER_TEMP/bridge/exec.py"
               ;;
