@@ -46,6 +46,7 @@ jobs:
       oss: ${{ steps.mk.outputs.oss }}
     steps:
       - name: Select platform matrix
+        id: mk
         shell: bash
         env:
           PLATFORMS: ${{ inputs.platforms }}
