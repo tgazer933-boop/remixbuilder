@@ -51,9 +51,22 @@ Mobile targets ride the existing legs: Android builds on the linux leg
 simulator/unsigned builds need no certificates, distribution signing
 requires your Apple certs).
 
+**Native GitHub Actions workflows (recommended).** A repository can just
+carry a standard `.github/workflows/*.yml` — written exactly as it would
+be on GitHub (`on: push`, `runs-on`, `steps` with `run:`/`uses:`). On
+push, the bridge reads the workflow, derives the platform legs from its
+`runs-on` values (including ARM labels like `ubuntu-24.04-arm`), and
+executes the matching jobs on the corresponding encrypted runners.
+Supported `uses:`: `actions/checkout` (no-op, source is already delivered),
+`actions/setup-{go,node,python,java,dotnet}` and rust setup actions
+(native bootstrap), `actions/upload-artifact` (collected into the Gitea
+release), cache actions (no-op). Anything else fails loudly. Not
+supported: job-level `matrix`/`needs`/`services`/`container`, and `${{ }}`
+expressions are passed through unevaluated.
+
 **Zero-adaptation usage.** A Gitea system webhook feeds a receiver on
-qdvps: any repository containing `.bridge/build.sh` builds automatically
-on push — no per-repo workflow file needed. Build state is reported back
+qdvps: any repository containing `.github/workflows/*.yml` or
+`.bridge/build.sh` builds automatically on push — nothing else needed. Build state is reported back
 as a commit status (`encrypted-bridge` context) and artifacts land on a
 Gitea release. Repositories that do carry an explicit
 `.gitea/workflows/bridge.yml` keep using the Actions path (the receiver
