@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       source_url_linux:
-        required: true
+        required: false
       source_url_macos:
-        required: true
+        required: false
       source_url_windows:
-        required: true
+        required: false
       transfer_sha256:
         required: true
       source_sha256:
