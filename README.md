@@ -35,8 +35,17 @@ Any Gitea repository can use the bridge by including an executable:
 .bridge/build.sh
 ```
 
-The script must be bash-compatible (Git Bash on the Windows leg) and runs on
-all three runner OSes; detect the host with `uname -s` when needed.
+The script must be bash-compatible (Git Bash on the Windows leg); detect
+the host with `uname -s` when needed.
+
+Optionally declare which runner OSes a repository builds on with
+`.bridge/platforms` (a single line, e.g. `windows` or `linux,macos`).
+Only the declared legs run — everything else (object upload, matrix,
+publish merge) scales down accordingly. Without the file all three OSes
+build. Mobile targets ride the existing legs: Android builds on the linux
+leg (preinstalled SDK + Gradle), iOS builds on the macos leg (Xcode;
+simulator/unsigned builds need no certificates, distribution signing
+requires your Apple certs).
 
 The script receives:
 
