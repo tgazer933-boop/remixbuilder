@@ -299,8 +299,9 @@ jobs:
               full.update(env)
               wd = step.get("working-directory")
               cwd = os.path.join(SRC, wd) if wd else SRC
-              if "${{" in script:
-                  log("warning: ${{ }} expressions are not evaluated by the bridge")
+              expr = "$" + "{{"
+              if expr in script:
+                  log("warning: expressions are not evaluated by the bridge")
               if shell in ("bash", "sh"):
                   cmd = ["bash", "-e", "-c", script]
               elif shell in ("pwsh", "powershell"):
