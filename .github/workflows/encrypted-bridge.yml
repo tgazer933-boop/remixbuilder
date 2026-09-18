@@ -52,16 +52,16 @@ jobs:
         run: |
           set -euo pipefail
           SELECT=$(python3 <<'PYSEL'
-import json, os
-m = {"linux": "ubuntu-latest", "macos": "macos-latest", "windows": "windows-latest"}
-c = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
-items = [x for x in os.environ["PLATFORMS"].split(",") if x]
-if not items or any(x not in m for x in items):
-    raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
-print(json.dumps([m[x] for x in items]))
-print(" ".join(c[x] for x in items))
-PYSEL
-)
+          import json, os
+          m = {"linux": "ubuntu-latest", "macos": "macos-latest", "windows": "windows-latest"}
+          c = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
+          items = [x for x in os.environ["PLATFORMS"].split(",") if x]
+          if not items or any(x not in m for x in items):
+              raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
+          print(json.dumps([m[x] for x in items]))
+          print(" ".join(c[x] for x in items))
+          PYSEL
+          )
           MATRIX=$(sed -n 1p <<<"$SELECT")
           OSS=$(sed -n 2p <<<"$SELECT")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
