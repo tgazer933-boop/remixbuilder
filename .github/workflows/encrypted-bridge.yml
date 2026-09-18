@@ -27,6 +27,8 @@ on:
         required: true
       output_pass_wrap:
         required: true
+      platforms:
+        required: true
 
 permissions: {}
 
@@ -35,11 +37,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      oss: ${{ steps.mk.outputs.oss }}
+    steps:
+      - name: Select platform matrix
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          declare -A MAP=([linux]=ubuntu-latest [macos]=macos-latest [windows]=windows-latest)
+          declare -A CAP=([linux]=Linux [macos]=macOS [windows]=Windows)
+          images="["; oss=""
+          IFS=',' read -ra items <<< "$PLATFORMS"
+          for item in "${items[@]}"; do
+            [[ -n "${MAP[$item]:-}" ]] || { echo "invalid platform: $item" >&2; exit 1; }
+            images="$images"${MAP[$item]}","
+            oss="$oss${CAP[$item]} "
+          done
+          images="${images%,}]"
+          oss="$(echo $oss)"  # trim
+          echo "matrix=$images" >> "$GITHUB_OUTPUT"
+          echo "oss=$oss" >> "$GITHUB_OUTPUT"
+          echo "selected: $images ($oss)"
+
   build:
+    needs: select
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.select.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions: {}
@@ -56,6 +88,7 @@ jobs:
       OUTPUT_AGE_RECIPIENT: ${{ inputs.output_age_recipient }}
       OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
       OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
+      PLATFORMS: ${{ inputs.platforms }}
 
     steps:
       - name: Install bridge tools
@@ -93,7 +126,8 @@ jobs:
               "SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS",
               "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
-              "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP"
+              "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
+              "PLATFORMS"
           )]
           canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
@@ -103,8 +137,12 @@ jobs:
           supplied = os.environ["REQUEST_SIG"].lower()
           if not hmac.compare_digest(expected, supplied):
               raise SystemExit("invalid request signature")
+          allowed = {"linux", "macos", "windows"}
+          chosen = os.environ["PLATFORMS"].split(",")
+          if not chosen or any(p not in allowed for p in chosen):
+              raise SystemExit("invalid platforms")
           for name in ("SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS"):
-              if not os.environ[name].startswith("http://47.104.2.255:3001/objects/"):
+              if os.environ[name] and not os.environ[name].startswith("http://47.104.2.255:3001/objects/"):
                   raise SystemExit("invalid " + name)
           exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
           if datetime.now(timezone.utc) >= exp:
@@ -224,7 +262,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [select, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -236,19 +274,23 @@ jobs:
       RECIPE: ${{ inputs.recipe }}
       OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
       OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
+      SELECTED_OSS: ${{ needs.select.outputs.oss }}
 
     steps:
       - name: Download encrypted intermediate (Linux)
+        if: contains(needs.select.outputs.oss, 'Linux')
         uses: actions/download-artifact@v7
         with:
           name: encrypted-output-Linux
 
       - name: Download encrypted intermediate (macOS)
+        if: contains(needs.select.outputs.oss, 'macOS')
         uses: actions/download-artifact@v7
         with:
           name: encrypted-output-macOS
 
       - name: Download encrypted intermediate (Windows)
+        if: contains(needs.select.outputs.oss, 'Windows')
         uses: actions/download-artifact@v7
         with:
           name: encrypted-output-Windows
@@ -273,7 +315,7 @@ jobs:
           shred -u "$wrap" "$RUNNER_TEMP/bridge/pass.age"
           echo "::add-mask::$OUTPUT_PASSPHRASE"
           mkdir output
-          for os in Linux macOS Windows; do
+          for os in $SELECTED_OSS; do
             slug=$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')
             age --decrypt -i "$eph" -o "output-$os.tar.gz" "output-$os.tar.gz.age"
             mkdir "output/$slug"
