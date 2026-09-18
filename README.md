@@ -77,6 +77,35 @@ Fetch and decrypt (the one-time passphrase is generated at submit time and consu
 - **Cross-border release downloads can stall.** `bridge-fetch.sh` resumes (`-C -`) with up to 8 attempts; a 16 MB asset typically completes in one or two attempts.
 - **Failing builds leave a pending one-time passphrase** on qdvps that is never fetched (swept after 14 days) and no release is published.
 
+## Automatic builds via Gitea Actions
+
+A `bridge`-labeled gitea-runner on qdvps acts as the dispatcher. Any Gitea
+repository that contains both `.bridge/build.sh` and
+`.gitea/workflows/bridge.yml` builds automatically on push:
+
+```yaml
+name: encrypted-bridge
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: bridge
+    timeout-minutes: 90
+    steps:
+      - name: Dispatch encrypted bridge build
+        run: /opt/remixbridge/bridge-gitea-job.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+```
+
+The dispatcher job submits the pushed ref through the encrypted bridge,
+waits for the linux/macos/windows matrix build, fetches and verifies the
+artifacts, deletes the temporary GitHub release, and publishes the decrypted
+artifacts as a Gitea release (`bridge-<version>` tag with a
+`bridge-artifacts-<version>.tar.gz` asset) on the source repository. Build
+status and logs appear in the Gitea Actions tab; pushes must go through the
+Gitea remote (direct filesystem pushes bypass the hooks and do not trigger).
+
 ## Important boundary
 
 GitHub runners must process plaintext source and plaintext intermediate output while building. Encryption protects transfer, storage, and published artifacts; it does not make GitHub an invisible execution environment.
