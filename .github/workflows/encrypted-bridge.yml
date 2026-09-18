@@ -74,9 +74,8 @@ jobs:
     needs: select
     strategy:
       fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.select.outputs.matrix) }}
-    runs-on: ${{ matrix.os }}
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 60
     permissions: {}
     env:
