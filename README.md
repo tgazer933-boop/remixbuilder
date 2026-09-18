@@ -38,14 +38,27 @@ Any Gitea repository can use the bridge by including an executable:
 The script must be bash-compatible (Git Bash on the Windows leg); detect
 the host with `uname -s` when needed.
 
-Optionally declare which runner OSes a repository builds on with
-`.bridge/platforms` (a single line, e.g. `windows` or `linux,macos`).
-Only the declared legs run — everything else (object upload, matrix,
-publish merge) scales down accordingly. Without the file all three OSes
-build. Mobile targets ride the existing legs: Android builds on the linux
-leg (preinstalled SDK + Gradle), iOS builds on the macos leg (Xcode;
+Optionally declare which legs a repository builds on with
+`.bridge/platforms` (a single line). Tokens are `os` (`linux`, `macos`,
+`windows` — legacy shorthands) or `os/arch` for multi-arch:
+`linux/amd64`, `linux/arm64`, `macos/amd64`, `macos/arm64`,
+`windows/amd64`. Example: `linux/amd64,linux/arm64,macos/arm64`.
+Only the declared legs run — object upload, the dynamic matrix, and the
+publish merge all scale accordingly; artifacts land in per-slug
+directories (`linux-arm64/`, …). Without the file the three defaults run.
+Mobile targets ride the existing legs: Android builds on the linux leg
+(preinstalled SDK + Gradle), iOS builds on the macos leg (Xcode;
 simulator/unsigned builds need no certificates, distribution signing
 requires your Apple certs).
+
+**Zero-adaptation usage.** A Gitea system webhook feeds a receiver on
+qdvps: any repository containing `.bridge/build.sh` builds automatically
+on push — no per-repo workflow file needed. Build state is reported back
+as a commit status (`encrypted-bridge` context) and artifacts land on a
+Gitea release. Repositories that do carry an explicit
+`.gitea/workflows/bridge.yml` keep using the Actions path (the receiver
+skips them to avoid double dispatch); the dispatcher's own `bridge-*`
+release tags never re-trigger builds.
 
 The script receives:
 
