@@ -51,20 +51,22 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
-          declare -A MAP=([linux]=ubuntu-latest [macos]=macos-latest [windows]=windows-latest)
-          declare -A CAP=([linux]=Linux [macos]=macOS [windows]=Windows)
-          images="["; oss=""
-          IFS=',' read -ra items <<< "$PLATFORMS"
-          for item in "${items[@]}"; do
-            [[ -n "${MAP[$item]:-}" ]] || { echo "invalid platform: $item" >&2; exit 1; }
-            images="$images"${MAP[$item]}","
-            oss="$oss${CAP[$item]} "
-          done
-          images="${images%,}]"
-          oss="$(echo $oss)"  # trim
-          echo "matrix=$images" >> "$GITHUB_OUTPUT"
-          echo "oss=$oss" >> "$GITHUB_OUTPUT"
-          echo "selected: $images ($oss)"
+          SELECT=$(python3 <<'PYSEL'
+import json, os
+m = {"linux": "ubuntu-latest", "macos": "macos-latest", "windows": "windows-latest"}
+c = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
+items = [x for x in os.environ["PLATFORMS"].split(",") if x]
+if not items or any(x not in m for x in items):
+    raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
+print(json.dumps([m[x] for x in items]))
+print(" ".join(c[x] for x in items))
+PYSEL
+)
+          MATRIX=$(sed -n 1p <<<"$SELECT")
+          OSS=$(sed -n 2p <<<"$SELECT")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "oss=$OSS" >> "$GITHUB_OUTPUT"
+          echo "selected: $MATRIX ($OSS)"
 
   build:
     needs: select
