@@ -1,4 +1,5 @@
 name: encrypted-build-bridge
+run-name: bridge-${{ inputs.public_version }}-${{ inputs.recipe }}
 
 on:
   workflow_dispatch:
