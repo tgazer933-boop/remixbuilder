@@ -17,7 +17,7 @@ This repository contains no project source. It only contains the trusted GitHub 
   - the intermediate artifact is encrypted to a second fresh age keypair per build, private half wrapped to the long-term output wrap key;
   - the final 7z passphrase is random per build, wrapped to the output wrap key, and delivered as ciphertext through public dispatch inputs.
 - qdvps persists no static age private keys. It holds only the two wrap public keys; the corresponding private keys exist solely as GitHub Secrets and are used only to unwrap per-build keys.
-- The object server is TLS-only (`https://47.104.2.255:3001`). The runner pins the server through the self-signed certificate embedded in the workflow; plain HTTP is refused.
+- The object channel (`http://47.104.2.255:3001`) deliberately runs without TLS: payloads are age-encrypted end to end, URLs are HMAC-signed, expiring, and single-use, and transfer integrity is enforced by SHA-256 verification on the runner.
 - Builds run on a Linux, macOS and Windows runner matrix; each leg encrypts its output separately and publish merges them into `linux/`, `macos/`, `windows/` directories of one release.
 - One one-time object per runner OS is uploaded for every submission (three signed, expiring URLs); each matrix leg downloads exactly its own object, preserving strict single-use semantics.
 - The whole dispatch request — URL, hashes, version, recipe, and the three one-time-key ciphertexts — is HMAC-signed; the runner rejects anything unsigned.
