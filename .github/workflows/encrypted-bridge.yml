@@ -3,12 +3,8 @@ name: encrypted-build-bridge
 on:
   workflow_dispatch:
     inputs:
-      source_url_linux:
-        required: false
-      source_url_macos:
-        required: false
-      source_url_windows:
-        required: false
+      source_urls:
+        required: true
       transfer_sha256:
         required: true
       source_sha256:
@@ -43,7 +39,7 @@ jobs:
     permissions: {}
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
-      oss: ${{ steps.mk.outputs.oss }}
+      slugs: ${{ steps.mk.outputs.slugs }}
     steps:
       - name: Select platform matrix
         id: mk
@@ -54,20 +50,25 @@ jobs:
           set -euo pipefail
           SELECT=$(python3 <<'PYSEL'
           import json, os
-          m = {"linux": "ubuntu-latest", "macos": "macos-latest", "windows": "windows-latest"}
-          c = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
+          m = {
+              "linux-amd64": "ubuntu-latest",
+              "linux-arm64": "ubuntu-24.04-arm",
+              "macos-amd64": "macos-13",
+              "macos-arm64": "macos-latest",
+              "windows-amd64": "windows-latest",
+          }
           items = [x for x in os.environ["PLATFORMS"].split(",") if x]
           if not items or any(x not in m for x in items):
               raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
-          print(json.dumps([m[x] for x in items]))
-          print(" ".join(c[x] for x in items))
+          print(json.dumps({"include": [{"slug": x, "image": m[x]} for x in items]}))
+          print(" ".join(items))
           PYSEL
           )
           MATRIX=$(sed -n 1p <<<"$SELECT")
-          OSS=$(sed -n 2p <<<"$SELECT")
+          SLUGS=$(sed -n 2p <<<"$SELECT")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "oss=$OSS" >> "$GITHUB_OUTPUT"
-          echo "selected: $MATRIX ($OSS)"
+          echo "slugs=$SLUGS" >> "$GITHUB_OUTPUT"
+          echo "selected: $MATRIX ($SLUGS)"
 
   build:
     needs: select
@@ -79,9 +80,8 @@ jobs:
     timeout-minutes: 60
     permissions: {}
     env:
-      SOURCE_URL_LINUX: ${{ inputs.source_url_linux }}
-      SOURCE_URL_MACOS: ${{ inputs.source_url_macos }}
-      SOURCE_URL_WINDOWS: ${{ inputs.source_url_windows }}
+      SOURCE_URL: ${{ fromJSON(inputs.source_urls)[matrix.slug] }}
+      SOURCE_URLS_JSON: ${{ inputs.source_urls }}
       TRANSFER_SHA256: ${{ inputs.transfer_sha256 }}
       SOURCE_SHA256: ${{ inputs.source_sha256 }}
       PUBLIC_VERSION: ${{ inputs.public_version }}
@@ -92,6 +92,7 @@ jobs:
       OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
       OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
       PLATFORMS: ${{ inputs.platforms }}
+      SLUG: ${{ matrix.slug }}
 
     steps:
       - name: Install bridge tools
@@ -123,11 +124,10 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bridge"
           cat > "$RUNNER_TEMP/bridge/verify.py" <<'PY'
-          import base64, hashlib, hmac, os, re, sys
+          import base64, hashlib, hmac, json, os, re, sys
           from datetime import datetime, timezone
           fields = [os.environ[x] for x in (
-              "SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS",
-              "TRANSFER_SHA256", "SOURCE_SHA256",
+              "SOURCE_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
               "PLATFORMS"
@@ -140,13 +140,13 @@ jobs:
           supplied = os.environ["REQUEST_SIG"].lower()
           if not hmac.compare_digest(expected, supplied):
               raise SystemExit("invalid request signature")
-          allowed = {"linux", "macos", "windows"}
-          chosen = os.environ["PLATFORMS"].split(",")
-          if not chosen or any(p not in allowed for p in chosen):
-              raise SystemExit("invalid platforms")
-          for name in ("SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS"):
-              if os.environ[name] and not os.environ[name].startswith("http://47.104.2.255:3001/objects/"):
-                  raise SystemExit("invalid " + name)
+          urls = json.loads(os.environ["SOURCE_URLS_JSON"])
+          slugs = [x for x in os.environ["PLATFORMS"].split(",") if x]
+          if set(urls) != set(slugs):
+              raise SystemExit("slug/url mismatch")
+          for slug, url in urls.items():
+              if not url.startswith("http://47.104.2.255:3001/objects/"):
+                  raise SystemExit("invalid url for " + slug)
           exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
           if datetime.now(timezone.utc) >= exp:
               raise SystemExit("request expired")
@@ -185,8 +185,6 @@ jobs:
 
       - name: Download encrypted source
         shell: bash
-        env:
-          SOURCE_URL: ${{ runner.os == 'Linux' && inputs.source_url_linux || (runner.os == 'macOS' && inputs.source_url_macos || inputs.source_url_windows) }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
@@ -270,6 +268,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_SHA256: ${{ inputs.source_sha256 }}
@@ -277,26 +276,24 @@ jobs:
       RECIPE: ${{ inputs.recipe }}
       OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
       OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
-      SELECTED_OSS: ${{ needs.select.outputs.oss }}
+      SELECTED_SLUGS: ${{ needs.select.outputs.slugs }}
 
     steps:
-      - name: Download encrypted intermediate (Linux)
-        if: contains(needs.select.outputs.oss, 'Linux')
-        uses: actions/download-artifact@v7
-        with:
-          name: encrypted-output-Linux
-
-      - name: Download encrypted intermediate (macOS)
-        if: contains(needs.select.outputs.oss, 'macOS')
-        uses: actions/download-artifact@v7
-        with:
-          name: encrypted-output-macOS
-
-      - name: Download encrypted intermediate (Windows)
-        if: contains(needs.select.outputs.oss, 'Windows')
-        uses: actions/download-artifact@v7
-        with:
-          name: encrypted-output-Windows
+      - name: Download per-leg encrypted intermediates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for slug in $SELECTED_SLUGS; do
+            aid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"encrypted-output-$slug\") | .id")
+            [[ -n "$aid" ]] || { echo "artifact missing for $slug" >&2; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$aid/zip" > "leg-$slug.zip"
+            mkdir "leg-$slug"
+            unzip -oq "leg-$slug.zip" -d "leg-$slug"
+            mv "leg-$slug/output-$slug.tar.gz.age" "output-$slug.tar.gz.age"
+            rm -rf "leg-$slug" "leg-$slug.zip"
+          done
 
       - name: Package password-encrypted release
         env:
@@ -318,12 +315,11 @@ jobs:
           shred -u "$wrap" "$RUNNER_TEMP/bridge/pass.age"
           echo "::add-mask::$OUTPUT_PASSPHRASE"
           mkdir output
-          for os in $SELECTED_OSS; do
-            slug=$(printf '%s' "$os" | tr '[:upper:]' '[:lower:]')
-            age --decrypt -i "$eph" -o "output-$os.tar.gz" "output-$os.tar.gz.age"
+          for slug in $SELECTED_SLUGS; do
+            age --decrypt -i "$eph" -o "output-$slug.tar.gz" "output-$slug.tar.gz.age"
             mkdir "output/$slug"
-            tar -xzf "output-$os.tar.gz" -C "output/$slug"
-            rm -f "output-$os.tar.gz" "output-$os.tar.gz.age"
+            tar -xzf "output-$slug.tar.gz" -C "output/$slug"
+            rm -f "output-$slug.tar.gz" "output-$slug.tar.gz.age"
           done
           shred -u "$eph"
           rm -f "$RUNNER_TEMP/bridge/output-key.age"
