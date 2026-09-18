@@ -104,7 +104,7 @@ jobs:
           if not hmac.compare_digest(expected, supplied):
               raise SystemExit("invalid request signature")
           for name in ("SOURCE_URL_LINUX", "SOURCE_URL_MACOS", "SOURCE_URL_WINDOWS"):
-              if not os.environ[name].startswith("https://47.104.2.255:3001/objects/"):
+              if not os.environ[name].startswith("http://47.104.2.255:3001/objects/"):
                   raise SystemExit("invalid " + name)
           exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
           if datetime.now(timezone.utc) >= exp:
@@ -132,20 +132,6 @@ jobs:
                   raise SystemExit("invalid " + name)
           PY
           chmod 700 "$RUNNER_TEMP/bridge/verify.py"
-          cat > "$RUNNER_TEMP/bridge/object-ca.pem" <<'PEM'
-          -----BEGIN CERTIFICATE-----
-          MIIBrDCCAVOgAwIBAgIUQaBf6E3bXQ7sXa7mQJTopo6SKv8wCgYIKoZIzj0EAwIw
-          HjEcMBoGA1UEAwwTcmVtaXhicmlkZ2Utb2JqZWN0czAeFw0yNjA5MTYxNTQ2MTNa
-          Fw0zNjA5MTMxNTQ2MTNaMB4xHDAaBgNVBAMME3JlbWl4YnJpZGdlLW9iamVjdHMw
-          WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR0tkohViSnm3oKFqqYvzhr3mmHUf4n
-          CewDcX8yhRRBQ2BAAtSTnHZ5C/l8V5VTb93Rogksfrron+G9L4AZA435o28wbTAd
-          BgNVHQ4EFgQUe0X+u2R1sj2kY7f1pTU0n0aYH0UwHwYDVR0jBBgwFoAUe0X+u2R1
-          sj2kY7f1pTU0n0aYH0UwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARhwQvaAL/
-          gglsb2NhbGhvc3QwCgYIKoZIzj0EAwIDRwAwRAIgVNmzjW8/YXjuMqT5sq6Euz4A
-          8hZtrkJx7CpnE+d1Kl0CIBt6Yty7vk8BDCYwWuxHa1APyQ8RD8Yjwjs+kqYslNyX
-          -----END CERTIFICATE-----
-          PEM
-          chmod 600 "$RUNNER_TEMP/bridge/object-ca.pem"
 
       - name: Verify request
         shell: bash
@@ -165,7 +151,6 @@ jobs:
           cd "$RUNNER_TEMP"
           curl --fail --location --silent --show-error \
             --retry 3 --connect-timeout 20 --max-time 600 \
-            --cacert bridge/object-ca.pem \
             "$SOURCE_URL" -o bundle.tar
           actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum bundle.tar | awk '{print $1}'; else shasum -a 256 bundle.tar | awk '{print $1}'; fi)
           echo "downloaded $(wc -c < bundle.tar) bytes, sha256=$actual expected=$TRANSFER_SHA256"
