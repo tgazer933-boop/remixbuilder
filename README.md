@@ -57,12 +57,28 @@ be on GitHub (`on: push`, `runs-on`, `steps` with `run:`/`uses:`). On
 push, the bridge reads the workflow, derives the platform legs from its
 `runs-on` values (including ARM labels like `ubuntu-24.04-arm`), and
 executes the matching jobs on the corresponding encrypted runners.
-Supported `uses:`: `actions/checkout` (no-op, source is already delivered),
-`actions/setup-{go,node,python,java,dotnet}` and rust setup actions
-(native bootstrap), `actions/upload-artifact` (collected into the Gitea
-release), cache actions (no-op). Anything else fails loudly. Not
-supported: job-level `matrix`/`needs`/`services`/`container`, and `${{ }}`
-expressions are passed through unevaluated.
+Supported `uses:`:
+- `actions/checkout` → no-op (source delivered by the bridge)
+- `actions/setup-{go,node,python,java,dotnet}` → native bootstrap
+- `actions/setup-rust` / `dtolnay/rust-toolchain` → rustup bootstrap
+- `actions/upload-artifact` → collected into the Gitea release
+- `actions/cache*` → no-op
+- **JavaScript actions** → cloned and executed with Node, standard
+  `INPUT_*` / `GITHUB_*` environment injected
+- **Docker actions** → built and run with volume-mounted workspace
+- **Composite actions** → cloned and steps executed recursively
+- anything else → hard error (fail loudly)
+
+Job-level `matrix` (with `runs-on: ${{ matrix.os }}`) and `needs` are
+supported. `${{ }}` expressions evaluate for: `github.sha/ref/repository/
+workspace`, `matrix.*`, `env.*`, `runner.os/arch`, `job.status`,
+`secrets.*`, `format()`, `contains()`, `startsWith()`, `endsWith()`,
+`join()`, `success()`, `failure()`, `always()`, `&&`, `||`, `!`.
+
+**Secrets**: stored on qdvps via `bridge-secret.sh set OWNER/REPO KEY
+VALUE` (Gitea's API is write-only). They travel age-encrypted through the
+bridge and surface in workflows as `${{ secrets.KEY }}` and environment
+variables. Not supported: `services:`, `container:`, `hashFiles()`.
 
 **Zero-adaptation usage.** A Gitea system webhook feeds a receiver on
 qdvps: any repository containing `.github/workflows/*.yml` or
