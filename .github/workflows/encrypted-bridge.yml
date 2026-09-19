@@ -236,6 +236,21 @@ jobs:
               print("[bridge-exec] " + msg, flush=True)
 
 
+          def _parse_secrets():
+              """Parse BRIDGE_SECRETS env var (KEY=value;KEY2=value2;) into a dict."""
+              raw = os.environ.get("BRIDGE_SECRETS", "")
+              result = {}
+              for pair in raw.split(";"):
+                  if "=" in pair:
+                      key, _, val = pair.partition("=")
+                      if key.strip():
+                          result[key.strip()] = val
+              return result
+
+
+          SECRETS = _parse_secrets()
+
+
           def ctx_map(matrix=None, env=None):
               ros, arch = SLUG.split("-", 1)
               flat = {
@@ -252,6 +267,8 @@ jobs:
                   flat["matrix." + k] = v
               for k, v in (env or {}).items():
                   flat["env." + k] = v
+              for k, v in SECRETS.items():
+                  flat["secrets." + k] = v
               return flat
 
 
@@ -385,17 +402,25 @@ jobs:
                   bootstrap("rust")
                   return
               if depth >= ACTION_DEPTH_LIMIT:
-                  sys.exit("composite action nesting too deep")
+                  sys.exit("action nesting too deep")
               adir = resolve_action(uses)
               meta_file = next((f for f in ("action.yml", "action.yaml")
                                 if os.path.isfile(os.path.join(adir, f))), None)
               if not meta_file:
-                  sys.exit("unsupported action (no composite metadata): " + uses)
+                  sys.exit("unsupported action (no metadata): " + uses)
               meta = yaml.safe_load(open(os.path.join(adir, meta_file), encoding="utf-8"))
               runs = (meta or {}).get("runs") or {}
-              if runs.get("using") != "composite":
-                  sys.exit("unsupported action type '" + str(runs.get("using")) + "' in " + uses +
-                           " (only composite actions can run on the bridge)")
+              using = str(runs.get("using", ""))
+
+              if using.startswith("node"):
+                  run_js_action(adir, meta, withs, flat)
+                  return
+              if using.startswith("docker"):
+                  run_docker_action(adir, meta, withs, flat)
+                  return
+              if using != "composite":
+                  sys.exit("unsupported action type '" + using + "' in " + uses)
+
               declared = meta.get("inputs") or {}
               inputs = {}
               for key, spec in declared.items():
@@ -407,6 +432,63 @@ jobs:
               log("composite action " + uses + " (inputs: " + (str(inputs) or "none") + ")")
               for step in runs.get("steps") or []:
                   execute_step(step, inner, job_env, depth + 1, action_dir=adir)
+
+
+          def run_js_action(adir, meta, withs, flat):
+              """Execute a JavaScript action by running its entry point with Node,
+              injecting the standard GitHub Actions runtime environment."""
+              entry = meta.get("runs", {}).get("main", "dist/index.js")
+              script = os.path.join(adir, entry)
+              if not os.path.isfile(script):
+                  sys.exit("JS action entry point not found: " + entry)
+              node = shutil.which("node")
+              if not node:
+                  sys.exit("node not available for JS action")
+              env = dict(os.environ)
+              env["GITHUB_WORKSPACE"] = SRC
+              env["GITHUB_ACTION"] = os.path.basename(adir)
+              env["GITHUB_ACTIONS"] = "true"
+              env["RUNNER_TEMP"] = os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
+              env["RUNNER_OS"] = flat.get("runner.os", "Linux")
+              for k, v in flat.items():
+                  env["GITHUB_CTX_" + k.replace(".", "_").upper()] = str(v)
+              declared = meta.get("inputs") or {}
+              for key, spec in declared.items():
+                  val = withs.get(key, (spec or {}).get("default", ""))
+                  val = interpolate(val, flat) if isinstance(val, str) else str(val)
+                  env["INPUT_" + key.replace(" ", "_").upper()] = val
+              for k, v in (os.environ.get("BRIDGE_SECRETS", "") or "").split(";"):
+                  if "=" in v:
+                      env["SECRET_" + v.split("=", 1)[0]] = v.split("=", 1)[1]
+              log("JS action: node " + entry + " (inputs: " +
+                  str({k: v for k, v in env.items() if k.startswith("INPUT_")}) + ")")
+              r = subprocess.run([node, script], cwd=adir, env=env)
+              if r.returncode != 0:
+                  sys.exit("JS action failed with exit code " + str(r.returncode))
+
+
+          def run_docker_action(adir, meta, withs, flat):
+              """Execute a Docker action by building and running its image."""
+              dockerfile = os.path.join(adir, meta.get("runs", {}).get("image", "Dockerfile"))
+              if not os.path.isfile(dockerfile):
+                  sys.exit("Docker action image not found")
+              tag = "bridge-action-" + os.path.basename(adir).lower()
+              r = subprocess.run(["docker", "build", "-q", "-t", tag, adir],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  sys.exit("docker build failed: " + r.stderr.strip())
+              env_args = []
+              declared = meta.get("inputs") or {}
+              for key, spec in declared.items():
+                  val = withs.get(key, (spec or {}).get("default", ""))
+                  val = interpolate(val, flat) if isinstance(val, str) else str(val)
+                  env_args += ["-e", "INPUT_" + key.replace(" ", "_").upper() + "=" + val]
+              env_args += ["-e", "GITHUB_WORKSPACE=/workspace"]
+              cmd = ["docker", "run", "--rm"] + env_args + ["-v", SRC + ":/workspace", tag]
+              log("Docker action: " + " ".join(cmd[:6]) + "...")
+              r = subprocess.run(cmd)
+              if r.returncode != 0:
+                  sys.exit("Docker action failed with exit code " + str(r.returncode))
 
 
           def execute_step(step, flat, job_env, depth, action_dir=None):
@@ -444,6 +526,8 @@ jobs:
                   env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
               full = dict(os.environ)
               full.update(env)
+              for k, v in SECRETS.items():
+                  full[k] = v
               wd = step.get("working-directory")
               cwd = os.path.join(SRC, wd) if wd else SRC
               if shell in ("bash", "sh"):
