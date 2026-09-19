@@ -284,6 +284,12 @@ jobs:
                                 repr(str(flat[path])), safe)
               safe = re.sub(r"\b(?<!')(format|contains|startsWith|endsWith|join|toJSON|"
                             r"success|failure|always|hashFiles)\(", r"__f['\1'](", safe)
+              # bare identifiers that aren't Python keywords become quoted strings
+              safe = re.sub(r"(?<!['\"\w])([a-z][a-z0-9_-]*[a-z0-9])(?!['\"\w])",
+                            lambda m: "'" + m.group(1) + "'"
+                            if m.group(1) not in ("and", "or", "not", "in", "is", "True", "False", "None", "if", "else", "elif")
+                            and not m.group(1).startswith("__f")
+                            else m.group(1), safe)
               if not ALLOWED.match(safe):
                   raise ValueError("unsupported expression: " + expr)
               return eval(safe, {"__builtins__": {}}, {"__f": FUNCS})  # noqa: S307
