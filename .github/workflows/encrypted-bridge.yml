@@ -270,7 +270,7 @@ jobs:
           }
 
           EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
-          ALLOWED = re.compile(r"^[a-zA-Z0-9_'\",().:!<>=%\-+*/ \[\]{}]*$")
+          ALLOWED = re.compile(r"^[a-zA-Z0-9_$'\",().:!<>=%\-+*/ \[\]{}]*$")
 
 
           def eval_expression(expr, flat):
@@ -538,8 +538,16 @@ jobs:
                               log("warning: cannot evaluate job if-condition, running: " + str(cond))
                       job_env = {}
                       for k, v in (job.get("env") or {}).items():
-                          job_env[k] = str(v)  # raw; expressions resolved per-step
+                          job_env[k] = str(v)
                       flat = ctx_map(matrix=combo, env=job_env)
+                      # resolve env values that reference matrix context
+                      for k in job_env:
+                          if "$" in job_env[k]:
+                              try:
+                                  job_env[k] = interpolate(job_env[k], flat)
+                                  flat["env." + k] = job_env[k]
+                              except ValueError:
+                                  pass
                       for k, v in combo.items():
                           key = re.sub(r"[^A-Za-z0-9_]", "_", k).upper()
                           os.environ["MATRIX_" + key] = str(v)
