@@ -732,9 +732,13 @@ jobs:
               if script is None:
                   return
               script = interpolate(script, flat)
-              shell = step.get("shell") or "bash"
+              shell = step.get("shell") or "sh"
               if shell in ("bash", "sh"):
-                  cmd = ["docker", "exec", cname, "bash", "-e", "-c", script]
+                  # Containers may not have bash (e.g. Alpine); try bash, fall back to sh
+                  probe = subprocess.run(["docker", "exec", cname, "which", "bash"],
+                                         capture_output=True, text=True)
+                  shell_bin = "bash" if probe.returncode == 0 else "sh"
+                  cmd = ["docker", "exec", cname, shell_bin, "-e", "-c", script]
               elif shell in ("pwsh", "powershell"):
                   cmd = ["docker", "exec", cname, "pwsh", "-Command", script]
               else:
