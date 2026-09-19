@@ -142,8 +142,7 @@ jobs:
               "SOURCE_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
-              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF",
-              "SECRETS_WRAP"
+              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF"
           )]
           canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
