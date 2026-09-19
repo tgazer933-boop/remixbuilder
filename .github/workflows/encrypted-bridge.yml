@@ -185,7 +185,7 @@ jobs:
                   raise SystemExit("invalid " + name)
           PY
           chmod 700 "$RUNNER_TEMP/bridge/verify.py"
-          cat > "$RUNNER_TEMP/bridge/exec.py" <<'EXEC'
+          cat > $RUNNER_TEMP/bridge/exec.py <<'EXEC
           #!/usr/bin/env python3
           # GitHub-Actions-compatible executor v2 for the encrypted bridge.
           # Runs the repository's own .github/workflows/*.yml natively:
@@ -583,6 +583,73 @@ jobs:
               return ordered
 
 
+          def start_services(services):
+              """Start service containers (Linux runners only). Returns (env_dict, container_names)."""
+              if not services or not SLUG.startswith("linux"):
+                  if services:
+                      log("services: skipped (only supported on Linux legs)")
+                  return {}, []
+              env = {}
+              names = []
+              for svc_name, svc in services.items():
+                  image = svc.get("image", "")
+                  if not image:
+                      continue
+                  cname = "bridge-svc-" + re.sub(r"[^a-zA-Z0-9_-]", "", svc_name)
+                  ports = svc.get("ports") or []
+                  port_args = []
+                  for p in ports:
+                      port_args += ["-p", str(p)]
+                  env_args = []
+                  for k, v in (svc.get("env") or {}).items():
+                      env_args += ["-e", f"{k}={v}"]
+                  cmd = ["docker", "run", "-d", "--name", cname] + port_args + env_args + [image]
+                  r = subprocess.run(cmd, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      log(f"service {svc_name}: failed to start ({r.stderr.strip()[:80]})")
+                      continue
+                  names.append(cname)
+                  env[f"{svc_name.upper().replace('-', '_')}_HOST"] = "127.0.0.1"
+                  if ports:
+                      env[f"{svc_name.upper().replace('-', '_')}_PORT"] = str(ports[0]).split(":")[0]
+                  log(f"service {svc_name}: started ({image}, ports={ports})")
+                  # Wait briefly for service to be reachable
+                  subprocess.run(["sleep", "3"], check=False)
+              return env, names
+
+
+          def stop_services(names):
+              for cname in names:
+                  subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
+                  log(f"service container {cname} stopped")
+
+
+          def start_job_container(container_spec):
+              """Start a job container (Linux only). Returns container name or None."""
+              if not container_spec or not SLUG.startswith("linux"):
+                  if container_spec:
+                      log("container: skipped (only supported on Linux legs)")
+                  return None
+              image = container_spec if isinstance(container_spec, str) else container_spec.get("image", "")
+              if not image:
+                  return None
+              cname = "bridge-job-" + os.getpid().__str__()
+              cmd = ["docker", "run", "-d", "--name", cname,
+                     "-v", SRC + ":/workspace", "-w", "/workspace", image, "sleep", "infinity"]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  log(f"container: failed to start ({r.stderr.strip()[:80]})")
+                  return None
+              log(f"container: started {image} as {cname}")
+              return cname
+
+
+          def stop_job_container(cname):
+              if cname:
+                  subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
+                  log(f"container {cname} stopped")
+
+
           def main():
               files = sorted(glob.glob(os.path.join(SRC, ".github/workflows/*.yml")) +
                              glob.glob(os.path.join(SRC, ".github/workflows/*.yaml")))
@@ -623,26 +690,58 @@ jobs:
                                   continue
                           except Exception:  # noqa: BLE001
                               log("warning: cannot evaluate job if-condition, running: " + str(cond))
-                      job_env = {}
-                      for k, v in (job.get("env") or {}).items():
-                          job_env[k] = str(v)
-                      flat = ctx_map(matrix=combo, env=job_env)
-                      # resolve env values that reference matrix context
-                      for k in job_env:
-                          if "$" in job_env[k]:
-                              try:
-                                  job_env[k] = interpolate(job_env[k], flat)
-                                  flat["env." + k] = job_env[k]
-                              except ValueError:
-                                  pass
-                      for k, v in combo.items():
-                          key = re.sub(r"[^A-Za-z0-9_]", "_", k).upper()
-                          os.environ["MATRIX_" + key] = str(v)
-                      for i, step in enumerate(job.get("steps") or []):
-                          label = step.get("name") or step.get("uses") or "run"
-                          log("-- step " + str(i + 1) + ": " + str(label))
-                          execute_step(step, flat, job_env, 0)
+
+                      # Start service containers and job container
+                      svc_env, svc_names = start_services(job.get("services"))
+                      job_cname = start_job_container(job.get("container"))
+                      try:
+                          job_env = {}
+                          for k, v in (job.get("env") or {}).items():
+                              job_env[k] = str(v)
+                          job_env.update(svc_env)
+                          flat = ctx_map(matrix=combo, env=job_env)
+                          for k in job_env:
+                              if "$" in job_env[k]:
+                                  try:
+                                      job_env[k] = interpolate(job_env[k], flat)
+                                      flat["env." + k] = job_env[k]
+                                  except ValueError:
+                                      pass
+                          for k, v in combo.items():
+                              key = re.sub(r"[^A-Za-z0-9_]", "_", k).upper()
+                              os.environ["MATRIX_" + key] = str(v)
+                          for i, step in enumerate(job.get("steps") or []):
+                              label = step.get("name") or step.get("uses") or "run"
+                              log("-- step " + str(i + 1) + ": " + str(label))
+                              if job_cname:
+                                  execute_step_in_container(step, flat, job_env, job_cname)
+                              else:
+                                  execute_step(step, flat, job_env, 0)
+                      finally:
+                          stop_services(svc_names)
+                          stop_job_container(job_cname)
               log("done")
+
+
+          def execute_step_in_container(step, flat, job_env, cname):
+              """Execute a run: step inside a Docker container via docker exec."""
+              if "uses" in step:
+                  execute_step(step, flat, job_env, 0)
+                  return
+              script = step.get("run")
+              if script is None:
+                  return
+              script = interpolate(script, flat)
+              shell = step.get("shell") or "bash"
+              if shell in ("bash", "sh"):
+                  cmd = ["docker", "exec", cname, "bash", "-e", "-c", script]
+              elif shell in ("pwsh", "powershell"):
+                  cmd = ["docker", "exec", cname, "pwsh", "-Command", script]
+              else:
+                  sys.exit("unsupported shell in container: " + str(shell))
+              r = subprocess.run(cmd, cwd=SRC)
+              if r.returncode != 0:
+                  sys.exit("container step failed with exit code " + str(r.returncode))
 
 
           if __name__ == "__main__":
