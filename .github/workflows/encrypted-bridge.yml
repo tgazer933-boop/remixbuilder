@@ -275,6 +275,10 @@ jobs:
 
           def eval_expression(expr, flat):
               safe = expr.strip()
+              # GitHub uses && || ! ; Python needs and or not
+              safe = re.sub(r"&&", " and ", safe)
+              safe = re.sub(r"\|\|", " or ", safe)
+              safe = re.sub(r"(?<![\w'\")])!", " not ", safe)
               for path in sorted(flat, key=len, reverse=True):
                   safe = re.sub(r"(?<![\w.])" + re.escape(path) + r"(?![\w])",
                                 repr(str(flat[path])), safe)
@@ -423,8 +427,16 @@ jobs:
                       log("step skipped by if-condition: " + str(step.get("name") or "run"))
                       return
               shell = step.get("shell") or "bash"
-              script = interpolate(script, flat)
+              step_env_raw = {}
+              for k, v in (step.get("env") or {}).items():
+                  step_env_raw[k] = str(v)
+              step_flat = dict(flat)
+              for k, v in step_env_raw.items():
+                  step_flat["env." + k] = v
+              script = interpolate(script, step_flat)
               env = dict(job_env)
+              for k, v in step_env_raw.items():
+                  env[k] = interpolate(v, step_flat)
               for k, v in (step.get("env") or {}).items():
                   env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
               full = dict(os.environ)
@@ -526,7 +538,8 @@ jobs:
                               log("warning: cannot evaluate job if-condition, running: " + str(cond))
                       job_env = {}
                       for k, v in (job.get("env") or {}).items():
-                          job_env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
+                          job_env[k] = str(v)  # raw; expressions resolved per-step
+                      flat = ctx_map(matrix=combo, env=job_env)
                       for k, v in combo.items():
                           key = re.sub(r"[^A-Za-z0-9_]", "_", k).upper()
                           os.environ["MATRIX_" + key] = str(v)
