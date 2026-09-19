@@ -693,12 +693,12 @@ jobs:
           cd "$RUNNER_TEMP"
           # The static secret only unwraps the one-time source key generated
           # for this build; the unwrapped key is destroyed right after use.
-          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > bridge/unwrap.agekey
-          chmod 600 bridge/unwrap.agekey
-          age --decrypt -i bridge/unwrap.agekey -o bridge/source.agekey bundle/key.age
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+          chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+          age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o bridge/source.agekey bundle/key.age
           age --decrypt -i bridge/source.agekey -o source.tar bundle/source.tar.age
-          shred -u bridge/unwrap.agekey bridge/source.agekey 2>/dev/null \
-            || rm -f bridge/unwrap.agekey bridge/source.agekey
+          shred -u "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey 2>/dev/null \
+            || rm -f "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey
           actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum source.tar | awk '{print $1}'; else shasum -a 256 source.tar | awk '{print $1}'; fi)
           if [[ "$actual" != "$SOURCE_SHA256" ]]; then
             echo "source sha256 mismatch: $actual" >&2
@@ -726,13 +726,13 @@ jobs:
             actions)
               PY=$(command -v python3 || command -v python)
               if [[ -n "$SECRETS_WRAP" && -n "${BRIDGE_SOURCE_AGE_KEY:-}" ]]; then
-                printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > bridge/unwrap.agekey
-                chmod 600 bridge/unwrap.agekey
-                printf '%s' "$SECRETS_WRAP" | base64 -d > bridge/secrets.age
-                age --decrypt -i bridge/unwrap.agekey -o bridge/secrets.txt bridge/secrets.age 2>/dev/null \
+                printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+                chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+                printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age"
+                age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o bridge/secrets.txt bridge/secrets.age 2>/dev/null \
                   || { echo "cannot decrypt secrets" >&2; exit 1; }
                 chmod 600 bridge/secrets.txt
-                rm -f bridge/secrets.age bridge/unwrap.agekey
+                rm -f bridge/secrets.age "$RUNNER_TEMP/bridge/unwrap.agekey"
               fi
               if ! "$PY" -c "import yaml" 2>/dev/null; then
                 "$PY" -m pip install --quiet --break-system-packages pyyaml \
@@ -741,9 +741,9 @@ jobs:
               fi
               "$PY" -c "import yaml" || { echo "pyyaml unavailable on this leg" >&2; exit 1; }
               export BRIDGE_SRC="$PWD"
-              if [[ -f bridge/secrets.txt ]]; then
-                export BRIDGE_SECRETS="$(cat bridge/secrets.txt)"
-                shred -u bridge/secrets.txt 2>/dev/null || rm -f bridge/secrets.txt
+              if [[ -f "$RUNNER_TEMP/bridge/secrets.txt" ]]; then
+                export BRIDGE_SECRETS="$(cat "$RUNNER_TEMP/bridge/secrets.txt")"
+                shred -u "$RUNNER_TEMP/bridge/secrets.txt" 2>/dev/null || rm -f "$RUNNER_TEMP/bridge/secrets.txt"
               fi
               "$PY" "$RUNNER_TEMP/bridge/exec.py"
               ;;
@@ -818,7 +818,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq age p7zip-full
           # Unwrap the one-time output keypair and passphrase for this build.
-          wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
+          wrap="$RUNNER_TEMP/"$RUNNER_TEMP/bridge/unwrap.agekey""
           eph="$RUNNER_TEMP/bridge/output.agekey"
           mkdir -p "$RUNNER_TEMP/bridge"
           printf '%s\n' "$BRIDGE_OUTPUT_AGE_KEY" > "$wrap"
