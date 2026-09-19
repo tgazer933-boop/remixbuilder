@@ -729,10 +729,11 @@ jobs:
                 printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
                 chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
                 printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age"
-                age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o bridge/secrets.txt bridge/secrets.age 2>/dev/null \
+                age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" \
+                  -o "$RUNNER_TEMP/bridge/secrets.txt" "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null \
                   || { echo "cannot decrypt secrets" >&2; exit 1; }
-                chmod 600 bridge/secrets.txt
-                rm -f bridge/secrets.age "$RUNNER_TEMP/bridge/unwrap.agekey"
+                chmod 600 "$RUNNER_TEMP/bridge/secrets.txt"
+                rm -f "$RUNNER_TEMP/bridge/secrets.age" "$RUNNER_TEMP/bridge/unwrap.agekey"
               fi
               if ! "$PY" -c "import yaml" 2>/dev/null; then
                 "$PY" -m pip install --quiet --break-system-packages pyyaml \
