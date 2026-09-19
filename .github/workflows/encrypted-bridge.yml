@@ -819,7 +819,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq age p7zip-full
           # Unwrap the one-time output keypair and passphrase for this build.
-          wrap="$RUNNER_TEMP/"$RUNNER_TEMP/bridge/unwrap.agekey""
+          wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
           eph="$RUNNER_TEMP/bridge/output.agekey"
           mkdir -p "$RUNNER_TEMP/bridge"
           printf '%s\n' "$BRIDGE_OUTPUT_AGE_KEY" > "$wrap"
