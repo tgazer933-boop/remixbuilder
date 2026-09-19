@@ -185,7 +185,7 @@ jobs:
                   raise SystemExit("invalid " + name)
           PY
           chmod 700 "$RUNNER_TEMP/bridge/verify.py"
-          cat > $RUNNER_TEMP/bridge/exec.py <<'EXEC
+          cat > $RUNNER_TEMP/bridge/exec.py <<'EXEC'
           #!/usr/bin/env python3
           # GitHub-Actions-compatible executor v2 for the encrypted bridge.
           # Runs the repository's own .github/workflows/*.yml natively:
