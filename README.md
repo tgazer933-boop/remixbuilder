@@ -78,7 +78,20 @@ workspace`, `matrix.*`, `env.*`, `runner.os/arch`, `job.status`,
 **Secrets**: stored on qdvps via `bridge-secret.sh set OWNER/REPO KEY
 VALUE` (Gitea's API is write-only). They travel age-encrypted through the
 bridge and surface in workflows as `${{ secrets.KEY }}` and environment
-variables. Not supported: `services:`, `container:`, `hashFiles()`.
+variables. Not supported: `hashFiles()`.
+
+**Services and containers** (Linux legs): `services:` starts Docker sidecar
+containers with port mapping (`REDIS_HOST=127.0.0.1`, `REDIS_PORT=6379`).
+`container:` runs steps inside a Docker container with the workspace
+volume-mounted (shell auto-detects bash/sh).
+
+**Re-run**: `bridge-rerun.sh OWNER/REPO [REF]` on qdvps, or `POST /rerun`
+on the webhook receiver with `{"repo":"owner/name","ref":"main"}` signed
+with the webhook secret.
+
+**Build logs**: attempted to attach to the Gitea release as `build-log.txt`;
+the GitHub logs API redirect requires further debugging. Meanwhile, logs
+are always viewable at the GitHub run page linked from the commit status.
 
 **Zero-adaptation usage.** A Gitea system webhook feeds a receiver on
 qdvps: any repository containing `.github/workflows/*.yml` or
