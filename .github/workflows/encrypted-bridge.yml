@@ -32,6 +32,8 @@ on:
         required: false
       ref:
         required: false
+      secrets_wrap:
+        required: false
 
 permissions: {}
 
@@ -102,6 +104,7 @@ jobs:
       CONTEXT_SHA: ${{ inputs.commit_sha }}
       CONTEXT_REPO: ${{ inputs.repo_slug }}
       CONTEXT_REF: ${{ inputs.ref || 'refs/heads/main' }}
+      SECRETS_WRAP: ${{ inputs.secrets_wrap }}
 
     steps:
       - name: Install bridge tools
@@ -139,7 +142,8 @@ jobs:
               "SOURCE_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
-              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF"
+              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF",
+              "SECRETS_WRAP"
           )]
           canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
@@ -573,6 +577,7 @@ jobs:
           CONTEXT_SHA: ${{ inputs.commit_sha }}
           CONTEXT_REPO: ${{ inputs.repo_slug }}
           CONTEXT_REF: ${{ inputs.ref || 'refs/heads/main' }}
+          SECRETS_WRAP: ${{ inputs.secrets_wrap }}
         run: |
           set -euo pipefail
           PY=$(command -v python3 || command -v python)
@@ -623,6 +628,8 @@ jobs:
 
       - name: Build source
         shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
         run: |
           set -euo pipefail
           export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/output"
@@ -635,6 +642,15 @@ jobs:
               ;;
             actions)
               PY=$(command -v python3 || command -v python)
+              if [[ -n "$SECRETS_WRAP" && -n "${BRIDGE_SOURCE_AGE_KEY:-}" ]]; then
+                printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > bridge/unwrap.agekey
+                chmod 600 bridge/unwrap.agekey
+                printf '%s' "$SECRETS_WRAP" | base64 -d > bridge/secrets.age
+                age --decrypt -i bridge/unwrap.agekey -o bridge/secrets.txt bridge/secrets.age 2>/dev/null \
+                  || { echo "cannot decrypt secrets" >&2; exit 1; }
+                chmod 600 bridge/secrets.txt
+                rm -f bridge/secrets.age bridge/unwrap.agekey
+              fi
               if ! "$PY" -c "import yaml" 2>/dev/null; then
                 "$PY" -m pip install --quiet --break-system-packages pyyaml \
                   || "$PY" -m pip install --quiet pyyaml \
@@ -642,6 +658,10 @@ jobs:
               fi
               "$PY" -c "import yaml" || { echo "pyyaml unavailable on this leg" >&2; exit 1; }
               export BRIDGE_SRC="$PWD"
+              if [[ -f bridge/secrets.txt ]]; then
+                export BRIDGE_SECRETS="$(cat bridge/secrets.txt)"
+                shred -u bridge/secrets.txt 2>/dev/null || rm -f bridge/secrets.txt
+              fi
               "$PY" "$RUNNER_TEMP/bridge/exec.py"
               ;;
             *)
