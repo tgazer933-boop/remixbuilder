@@ -85,7 +85,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
     runs-on: ${{ matrix.image }}
-    timeout-minutes: 60
+    timeout-minutes: 180
     permissions: {}
     env:
       SOURCE_URL: ${{ fromJSON(inputs.source_urls)[matrix.slug] }}
@@ -189,14 +189,19 @@ jobs:
           #!/usr/bin/env python3
           # GitHub-Actions-compatible executor v2 for the encrypted bridge.
           # Runs the repository's own .github/workflows/*.yml natively:
+          #   - trigger-aware workflow selection (tag pushes pick tag workflows)
           #   - job matrix expansion (runs-on derived legs; combos run on their leg)
           #   - needs topological ordering (same-leg; cross-leg auto-satisfied)
-          #   - expression subset: github.sha/ref/repository/workspace, matrix.*, env.*,
-          #     runner.os/arch, job.status, format/contains/startsWith/endsWith/join/
-          #     toJSON, success()/failure()/always()
+          #     with same-leg job outputs (needs.<job>.outputs.<key>)
+          #   - expression subset: github.sha/ref/ref_name/repository/workspace,
+          #     matrix.*, env.*, runner.os/arch, job.status, format/contains/
+          #     startsWith/endsWith/join/toJSON, success()/failure()/always()
+          #   - GITHUB_ENV / GITHUB_PATH / GITHUB_OUTPUT file semantics
           #   - uses: composite actions cloned and executed recursively; checkout/cache
-          #     no-op; setup-* bootstrapped; upload-artifact collected; javascript and
-          #     docker actions fail loudly
+          #     no-op; setup-* bootstrapped (incl. dtolnay/rust-toolchain with
+          #     toolchain/target inputs); upload-artifact collected; release-publishing
+          #     steps (gh release *, softprops/action-gh-release, attestations) are
+          #     skipped and their files collected - the bridge publishes to Gitea
           import glob
           import itertools
           import json
@@ -215,8 +220,21 @@ jobs:
           CONTEXT_SHA = os.environ.get("CONTEXT_SHA", "")
           CONTEXT_REPO = os.environ.get("CONTEXT_REPO", "")
           CONTEXT_REF = os.environ.get("CONTEXT_REF", "")
+          REF_NAME = re.sub(r"^refs/(tags|heads)/", "", CONTEXT_REF)
+          IS_TAG = CONTEXT_REF.startswith("refs/tags/")
           JOB_STATUS = "success"
           ACTION_DEPTH_LIMIT = 5
+          # Completed job outputs: job id -> {output key: value}
+          JOB_OUTPUTS = {}
+          # GITHUB_OUTPUT contents accumulated for the job currently executing
+          CURRENT_GOUTPUT = {}
+          # Actions whose only purpose is publishing to GitHub; the bridge publishes
+          # to Gitea itself, so these are skipped instead of run.
+          PUBLISH_USES = {
+              "softprops/action-gh-release", "ncipollo/release-action",
+              "marvinpinto/action-automatic-releases", "release-drafter/release-drafter",
+              "actions/attest-build-provenance",
+          }
 
           LABEL2SLUG = {
               "ubuntu-latest": "linux-amd64", "ubuntu-24.04": "linux-amd64",
@@ -234,6 +252,67 @@ jobs:
 
           def log(msg):
               print("[bridge-exec] " + msg, flush=True)
+
+
+          def _parse_kv_file(path):
+              """Parse a GITHUB_ENV/GITHUB_OUTPUT style file (KEY=value lines and the
+              multiline KEY<<delim form). Returns a dict."""
+              result = {}
+              try:
+                  lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+              except OSError:
+                  return result
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)<<(.+)$", line)
+                  if m:
+                      key, delim = m.group(1), m.group(2)
+                      vals = []
+                      i += 1
+                      while i < len(lines) and lines[i] != delim:
+                          vals.append(lines[i])
+                          i += 1
+                      result[key] = "\n".join(vals)
+                  elif "=" in line:
+                      key, _, val = line.partition("=")
+                      result[key] = val
+                  i += 1
+              return result
+
+
+          def seed_needs(flat):
+              """Expose completed job outputs under needs.<job>.outputs.<key>.
+              Cross-leg dependencies cannot be observed here; a missing outputs.version
+              falls back to the pushed tag/branch name (the overwhelmingly common use).
+              """
+              for job_id, outs in JOB_OUTPUTS.items():
+                  for k, v in outs.items():
+                      flat["needs." + job_id + ".outputs." + k] = str(v)
+              flat.setdefault("needs.create-release.outputs.version", REF_NAME)
+
+
+          def collect_existing(paths):
+              """Copy already-built files (referenced by a skipped publish step) into
+              the bridge output directory so they still reach the Gitea release."""
+              n = 0
+              for raw in paths:
+                  p = raw.strip().strip('"').strip("'")
+                  if not p or p.startswith("-"):
+                      continue
+                  for base in (SRC, os.getcwd()):
+                      full = p if os.path.isabs(p) else os.path.join(base, p)
+                      if os.path.isfile(full):
+                          dest = os.path.join(OUT, os.path.basename(full))
+                          os.makedirs(OUT, exist_ok=True)
+                          shutil.copy2(full, dest)
+                          log("artifact collected (from publish step): " + os.path.basename(full))
+                          n += 1
+                          break
+              return n
+
+
+          PUBLISH_RUN_RE = re.compile(r"(^|\n|\s|;|&&|\|\|)\s*gh\s+release\s+(create|upload|edit|delete|view)\b")
 
 
           def _parse_secrets():
@@ -256,6 +335,8 @@ jobs:
               flat = {
                   "github.sha": CONTEXT_SHA,
                   "github.ref": CONTEXT_REF,
+                  "github.ref_name": REF_NAME,
+                  "github.ref_type": "tag" if IS_TAG else "branch",
                   "github.repository": CONTEXT_REPO,
                   "github.workspace": SRC,
                   "github.event_name": "push",
@@ -398,8 +479,24 @@ jobs:
               if name == "actions/setup-go":
                   bootstrap("go")
                   return
-              if name in ("actions/setup-rust", "dtolnay/rust-toolchain"):
+              if name in ("dtolnay/rust-toolchain", "actions-rust-lang/setup-rust-toolchain"):
                   bootstrap("rust")
+                  tc = str(withs.get("toolchain") or withs.get("toolchains") or "").strip()
+                  tc = tc.split(",")[0].strip() or "stable"
+                  tgt = str(withs.get("target") or withs.get("targets") or "").strip()
+                  tgt = tgt.split(",")[0].strip()
+                  cmd = ["rustup", "toolchain", "install", tc, "--profile", "minimal"]
+                  if tgt:
+                      cmd += ["--target", tgt]
+                  r = subprocess.run(cmd, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      log("warning: rustup install failed: " + r.stderr.strip()[:200])
+                  os.environ["RUSTUP_TOOLCHAIN"] = tc
+                  log("rust toolchain ready: " + tc + (" +" + tgt if tgt else ""))
+                  return
+              if name in PUBLISH_USES or any(name == p or name.startswith(p + "/")
+                                             for p in PUBLISH_USES):
+                  log("publish action skipped (the bridge publishes to Gitea): " + uses)
                   return
               if depth >= ACTION_DEPTH_LIMIT:
                   sys.exit("action nesting too deep")
@@ -518,16 +615,37 @@ jobs:
               step_flat = dict(flat)
               for k, v in step_env_raw.items():
                   step_flat["env." + k] = v
+              seed_needs(step_flat)
               script = interpolate(script, step_flat)
               env = dict(job_env)
               for k, v in step_env_raw.items():
                   env[k] = interpolate(v, step_flat)
               for k, v in (step.get("env") or {}).items():
                   env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
+              if PUBLISH_RUN_RE.search(script):
+                  n = 0
+                  for line in script.splitlines():
+                      if re.search(r"\bgh\s+release\s+upload\b", line):
+                          toks = [t for t in line.split()
+                                  if t not in ("gh", "release", "upload")]
+                          n += collect_existing(toks[1:])  # first token is the tag
+                  log("step skipped (publishing handled by the bridge"
+                      + (", collected " + str(n) + " files" if n else "") + "): "
+                      + str(step.get("name") or "run"))
+                  return
               full = dict(os.environ)
               full.update(env)
               for k, v in SECRETS.items():
                   full[k] = v
+              # GitHub Actions file-mediated variables
+              env_file = tempfile.mktemp(prefix="benv-")
+              path_file = tempfile.mktemp(prefix="bpath-")
+              out_file = tempfile.mktemp(prefix="bout-")
+              for f in (env_file, path_file, out_file):
+                  open(f, "w", encoding="utf-8").close()
+              full["GITHUB_ENV"] = env_file
+              full["GITHUB_PATH"] = path_file
+              full["GITHUB_OUTPUT"] = out_file
               wd = step.get("working-directory")
               cwd = os.path.join(SRC, wd) if wd else SRC
               if shell in ("bash", "sh"):
@@ -544,6 +662,27 @@ jobs:
               except (TypeError, ValueError):
                   timeout = None
               r = subprocess.run(cmd, cwd=cwd, env=full, timeout=timeout)
+              # Fold GITHUB_ENV / GITHUB_PATH / GITHUB_OUTPUT back in for later steps.
+              for k, v in _parse_kv_file(env_file).items():
+                  job_env[k] = v
+                  flat["env." + k] = v
+                  os.environ[k] = v
+                  log("GITHUB_ENV " + k + " set")
+              try:
+                  with open(path_file, encoding="utf-8", errors="replace") as fh:
+                      for line in fh.read().splitlines():
+                          line = line.strip()
+                          if line and os.path.isdir(line):
+                              os.environ["PATH"] = line + os.pathsep + os.environ["PATH"]
+                              log("GITHUB_PATH +" + line)
+              except OSError:
+                  pass
+              CURRENT_GOUTPUT.update(_parse_kv_file(out_file))
+              for f in (env_file, path_file, out_file):
+                  try:
+                      os.remove(f)
+                  except OSError:
+                      pass
               if r.returncode != 0:
                   sys.exit("step failed with exit code " + str(r.returncode))
 
@@ -650,11 +789,102 @@ jobs:
                   log(f"container {cname} stopped")
 
 
+          def _pat2re(pat):
+              """Translate a GitHub branch/tag filter pattern to a regex. GitHub's
+              matcher supports * ** ? [] and + (one or more of the preceding char),
+              which fnmatch does not."""
+              out = []
+              i = 0
+              pat = str(pat)
+              while i < len(pat):
+                  c = pat[i]
+                  if c == "[":
+                      j = pat.find("]", i + 1)
+                      if j == -1:
+                          out.append(re.escape(c))
+                          i += 1
+                          continue
+                      inner = pat[i + 1:j]
+                      neg = inner[:1] in ("!", "^")
+                      if neg:
+                          inner = inner[1:]
+                      out.append(("[^" if neg else "[") + inner + "]")
+                      i = j + 1
+                  elif c == "*":
+                      if pat[i:i + 2] == "**":
+                          out.append(".*")
+                          i += 2
+                      else:
+                          out.append("[^/]*")
+                          i += 1
+                  elif c == "?":
+                      out.append("[^/]")
+                      i += 1
+                  elif c == "+":
+                      if out:
+                          out[-1] += "+"
+                      i += 1
+                  else:
+                      out.append(re.escape(c))
+                      i += 1
+              return "^" + "".join(out) + "$"
+
+
+          def _trigger_matches(wf, is_tag):
+              """Does this workflow's push trigger fire for the current ref?"""
+              on = wf.get("on")
+              if on is None and True in wf:  # pyyaml parses a bare `on:` as True
+                  on = wf[True]
+              if isinstance(on, bool) or on is None:
+                  on = {}
+              if isinstance(on, str):
+                  return on == "push" and not is_tag
+              if isinstance(on, list):
+                  if "push" not in on:
+                      return False
+                  on = {}
+              if not isinstance(on, dict):
+                  return False
+              push = on.get("push")
+              if push is None:
+                  return "push" in on or not on
+              if not isinstance(push, dict):
+                  return True
+              if is_tag:
+                  tags = push.get("tags")
+                  if not tags:
+                      return False
+                  return any(re.match(_pat2re(t), REF_NAME) for t in tags)
+              branches = push.get("branches")
+              if not branches:
+                  return True
+              return any(re.match(_pat2re(b), REF_NAME) for b in branches)
+
+
+          def _pick_workflow(files):
+              """bridge.yml wins; otherwise prefer workflows whose push trigger fires
+              for this ref (tag vs branch), then ones that produce artifacts."""
+              preferred = [f for f in files if os.path.basename(f) == "bridge.yml"]
+              if preferred:
+                  return preferred[0]
+              scored = []
+              for f in files:
+                  try:
+                      wf = yaml.safe_load(open(f, encoding="utf-8")) or {}
+                  except Exception:  # noqa: BLE001
+                      continue
+                  body = open(f, encoding="utf-8", errors="replace").read()
+                  score = (1 if _trigger_matches(wf, IS_TAG) else 0,
+                           1 if "upload-artifact" in body else 0)
+                  scored.append((score, f))
+              scored.sort(key=lambda x: (-x[0][0], -x[0][1], x[1]))
+              return scored[0][1]
+
+
           def main():
               files = sorted(glob.glob(os.path.join(SRC, ".github/workflows/*.yml")) +
                              glob.glob(os.path.join(SRC, ".github/workflows/*.yaml")))
-              preferred = [f for f in files if os.path.basename(f) == "bridge.yml"]
-              wf_file = (preferred or files)[0] if files else None
+              wf_file = _pick_workflow(files) if files else None
               if not wf_file:
                   sys.exit("no .github/workflows/*.yml found in the repository")
               log("workflow: " + os.path.relpath(wf_file, SRC))
@@ -674,6 +904,7 @@ jobs:
                   combos = expand_matrix(matrix) if matrix else [{}]
                   for combo in combos:
                       flat = ctx_map(matrix=combo)
+                      seed_needs(flat)
                       runs_on = str(job.get("runs-on", ""))
                       if "$" in runs_on:
                           runs_on = interpolate(runs_on, flat)
@@ -717,6 +948,20 @@ jobs:
                                   execute_step_in_container(step, flat, job_env, job_cname)
                               else:
                                   execute_step(step, flat, job_env, 0)
+                          # Resolve declared job outputs for needs.<job>.outputs.*.
+                          outs = {}
+                          out_flat = ctx_map(matrix=combo, env=job_env)
+                          for ok, ov in (job.get("outputs") or {}).items():
+                              try:
+                                  outs[ok] = interpolate(str(ov), out_flat)
+                              except Exception:  # noqa: BLE001
+                                  outs[ok] = ""
+                          for ok, ov in CURRENT_GOUTPUT.items():
+                              outs.setdefault(ok, str(ov))
+                          if outs:
+                              JOB_OUTPUTS[name] = outs
+                              log("job " + name + " outputs: " + str(outs))
+                          CURRENT_GOUTPUT.clear()
                       finally:
                           stop_services(svc_names)
                           stop_job_container(job_cname)
@@ -732,13 +977,9 @@ jobs:
               if script is None:
                   return
               script = interpolate(script, flat)
-              shell = step.get("shell") or "sh"
+              shell = step.get("shell") or "bash"
               if shell in ("bash", "sh"):
-                  # Containers may not have bash (e.g. Alpine); try bash, fall back to sh
-                  probe = subprocess.run(["docker", "exec", cname, "which", "bash"],
-                                         capture_output=True, text=True)
-                  shell_bin = "bash" if probe.returncode == 0 else "sh"
-                  cmd = ["docker", "exec", cname, shell_bin, "-e", "-c", script]
+                  cmd = ["docker", "exec", cname, "bash", "-e", "-c", script]
               elif shell in ("pwsh", "powershell"):
                   cmd = ["docker", "exec", cname, "pwsh", "-Command", script]
               else:
