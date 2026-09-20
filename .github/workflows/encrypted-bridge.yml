@@ -328,6 +328,9 @@ jobs:
 
 
           SECRETS = _parse_secrets()
+          # GitHub always provides GITHUB_TOKEN; on the bridge it has no authority
+          # (publishing goes to Gitea), but steps referencing it must still resolve.
+          SECRETS.setdefault("GITHUB_TOKEN", "")
 
 
           def ctx_map(matrix=None, env=None):
@@ -395,7 +398,10 @@ jobs:
                   try:
                       return str(eval_expression(m.group(1), flat))
                   except Exception as e:  # noqa: BLE001
-                      raise ValueError("cannot evaluate " + m.group(0) + ": " + str(e))
+                      # GitHub resolves unknown context to empty; never kill the build.
+                      log("warning: unresolved expression, substituting empty: "
+                          + m.group(0) + " (" + str(e)[:120] + ")")
+                      return ""
               return EXPR_RE.sub(sub, str(text))
 
 
@@ -619,9 +625,17 @@ jobs:
               script = interpolate(script, step_flat)
               env = dict(job_env)
               for k, v in step_env_raw.items():
-                  env[k] = interpolate(v, step_flat)
+                  try:
+                      env[k] = interpolate(v, step_flat)
+                  except ValueError as e:  # noqa: BLE001
+                      log("warning: step env " + k + " unresolved, using empty: " + str(e))
+                      env[k] = ""
               for k, v in (step.get("env") or {}).items():
-                  env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
+                  try:
+                      env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
+                  except ValueError as e:  # noqa: BLE001
+                      log("warning: step env " + k + " unresolved, using empty: " + str(e))
+                      env[k] = ""
               if PUBLISH_RUN_RE.search(script):
                   n = 0
                   for line in script.splitlines():
