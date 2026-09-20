@@ -607,6 +607,18 @@ jobs:
                   sys.exit("Docker action failed with exit code " + str(r.returncode))
 
 
+          def _bash_cmd():
+              """Resolve bash the way GitHub does: Git Bash on Windows (PATH lookup
+              would find WSL's bash.exe, which has no distribution installed)."""
+              if sys.platform == "win32" or SLUG.startswith("windows"):
+                  for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                               r"C:\Program Files\Git\usr\bin\bash.exe",
+                               r"C:\Program Files (x86)\Git\bin\bash.exe"):
+                      if os.path.isfile(cand):
+                          return [cand, "--noprofile", "--norc", "-e", "-o", "pipefail"]
+              return ["bash", "-e", "-o", "pipefail"]
+
+
           def execute_step(step, flat, job_env, depth, action_dir=None):
               if "uses" in step:
                   withs = {}
@@ -676,7 +688,7 @@ jobs:
               wd = step.get("working-directory")
               cwd = os.path.join(SRC, wd) if wd else SRC
               if shell in ("bash", "sh"):
-                  cmd = ["bash", "-e", "-c", script]
+                  cmd = _bash_cmd() + ["-c", script]
               elif shell in ("pwsh", "powershell"):
                   cmd = ["pwsh", "-Command", script]
               else:
