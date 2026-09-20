@@ -228,6 +228,10 @@ jobs:
           JOB_OUTPUTS = {}
           # GITHUB_OUTPUT contents accumulated for the job currently executing
           CURRENT_GOUTPUT = {}
+          # Pristine snapshot of the source workspace (fresh-runner semantics)
+          PRISTINE = None
+          # Temp entries that belong to the bridge itself and must survive resets
+          TEMP_KEEP = ("bridge", "output")
           # Actions whose only purpose is publishing to GitHub; the bridge publishes
           # to Gitea itself, so these are skipped instead of run.
           PUBLISH_USES = {
@@ -904,6 +908,50 @@ jobs:
               return scored[0][1]
 
 
+          def _reset_workspace():
+              """Fresh-runner semantics between matrix combos: first call snapshots
+              the pristine source workspace; later calls restore it and clear stale
+              RUNNER_TEMP entries (bridge scripts and collected output are kept)."""
+              global PRISTINE
+              if PRISTINE is None:
+                  PRISTINE = tempfile.mkdtemp(prefix="bridge-pristine-")
+                  for entry in os.listdir(SRC):
+                      s, d = os.path.join(SRC, entry), os.path.join(PRISTINE, entry)
+                      if os.path.isdir(s) and not os.path.islink(s):
+                          shutil.copytree(s, d, symlinks=True)
+                      else:
+                          shutil.copy2(s, d, follow_symlinks=False)
+                  return
+              for entry in os.listdir(SRC):
+                  p = os.path.join(SRC, entry)
+                  if os.path.isdir(p) and not os.path.islink(p):
+                      shutil.rmtree(p, ignore_errors=True)
+                  else:
+                      try:
+                          os.remove(p)
+                      except OSError:
+                          pass
+              for entry in os.listdir(PRISTINE):
+                  s, d = os.path.join(PRISTINE, entry), os.path.join(SRC, entry)
+                  if os.path.isdir(s) and not os.path.islink(s):
+                      shutil.copytree(s, d, symlinks=True)
+                  else:
+                      shutil.copy2(s, d, follow_symlinks=False)
+              rt = os.environ.get("RUNNER_TEMP")
+              if rt and os.path.isdir(rt):
+                  for entry in os.listdir(rt):
+                      if entry in TEMP_KEEP or entry.startswith("output-"):
+                          continue
+                      p = os.path.join(rt, entry)
+                      if os.path.isdir(p) and not os.path.islink(p):
+                          shutil.rmtree(p, ignore_errors=True)
+                      else:
+                          try:
+                              os.remove(p)
+                          except OSError:
+                              pass
+
+
           def main():
               files = sorted(glob.glob(os.path.join(SRC, ".github/workflows/*.yml")) +
                              glob.glob(os.path.join(SRC, ".github/workflows/*.yaml")))
@@ -925,6 +973,9 @@ jobs:
                           log("job " + name + ": cross-leg needs " + str(cross) + " treated as satisfied")
                   matrix = (job.get("strategy") or {}).get("matrix")
                   combos = expand_matrix(matrix) if matrix else [{}]
+                  if len(combos) > 1:
+                      log("job " + name + ": " + str(len(combos))
+                          + " matrix combos run sequentially on this leg")
                   for combo in combos:
                       flat = ctx_map(matrix=combo)
                       seed_needs(flat)
@@ -934,6 +985,10 @@ jobs:
                       slug = LABEL2SLUG.get(runs_on)
                       if slug != SLUG:
                           continue
+                      # GitHub gives every matrix combo a fresh runner; approximate
+                      # that with a pristine workspace, clean temp, restored env.
+                      env_snap = dict(os.environ)
+                      _reset_workspace()
                       mdesc = " matrix=" + str(combo) if combo else ""
                       log("== job " + name + " (runs-on " + runs_on + ")" + mdesc + " ==")
                       cond = job.get("if")
@@ -988,6 +1043,9 @@ jobs:
                       finally:
                           stop_services(svc_names)
                           stop_job_container(job_cname)
+                          if len(combos) > 1:
+                              os.environ.clear()
+                              os.environ.update(env_snap)
               log("done")
 
 
