@@ -377,12 +377,21 @@ jobs:
           ALLOWED = re.compile(r"^[a-zA-Z0-9_$'\",().:!<>=%\-+*/ \[\]{}]*$")
 
 
+          CTX_TOKEN_RE = re.compile(
+              r"\b(matrix|env|secrets|github|runner|job|jobs|needs|steps|inputs|"
+              r"vars|strategy)\.[A-Za-z0-9_.\-]+")
+
+
           def eval_expression(expr, flat):
               safe = expr.strip()
               # GitHub uses && || ! ; Python needs and or not
               safe = re.sub(r"&&", " and ", safe)
               safe = re.sub(r"\|\|", " or ", safe)
-              safe = re.sub(r"(?<![\w'\")])!", " not ", safe)
+              safe = re.sub(r"(?<![\w'\")])!(?!=)", " not ", safe)
+              # Context references absent from flat resolve to empty strings, exactly
+              # like GitHub (e.g. matrix keys not defined for this combo).
+              safe = CTX_TOKEN_RE.sub(
+                  lambda m: m.group(0) if m.group(0) in flat else "''", safe)
               for path in sorted(flat, key=len, reverse=True):
                   safe = re.sub(r"(?<![\w.])" + re.escape(path) + r"(?![\w])",
                                 repr(str(flat[path])), safe)
