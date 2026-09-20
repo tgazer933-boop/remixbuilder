@@ -62,9 +62,11 @@ jobs:
           m = {
               "linux-amd64": "ubuntu-latest",
               "linux-arm64": "ubuntu-24.04-arm",
+              "linux-amd64-cuda": "[self-hosted, linux, x64, cuda]",
               "macos-amd64": "macos-15-intel",
               "macos-arm64": "macos-latest",
               "windows-amd64": "windows-latest",
+              "windows-arm64": "windows-11-arm",
           }
           items = [x for x in os.environ["PLATFORMS"].split(",") if x]
           if not items or any(x not in m for x in items):
@@ -211,9 +213,9 @@ jobs:
           import subprocess
           import sys
           import tempfile
-
+          
           import yaml
-
+          
           SLUG = os.environ["SLUG"]
           SRC = os.environ.get("BRIDGE_SRC", os.getcwd())
           OUT = os.environ["BRIDGE_OUTPUT_DIR"]
@@ -245,7 +247,7 @@ jobs:
               "marvinpinto/action-automatic-releases", "release-drafter/release-drafter",
               "actions/attest-build-provenance",
           }
-
+          
           LABEL2SLUG = {
               "ubuntu-latest": "linux-amd64", "ubuntu-24.04": "linux-amd64",
               "ubuntu-22.04": "linux-amd64", "ubuntu-latest-arm64": "linux-arm64",
@@ -258,12 +260,12 @@ jobs:
           }
           SLUG2RUNNER_OS = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
           SLUG2ARCH = {"amd64": "X64", "arm64": "ARM64"}
-
-
+          
+          
           def log(msg):
               print("[bridge-exec] " + msg, flush=True)
-
-
+          
+          
           def _parse_kv_file(path):
               """Parse a GITHUB_ENV/GITHUB_OUTPUT style file (KEY=value lines and the
               multiline KEY<<delim form). Returns a dict."""
@@ -289,8 +291,8 @@ jobs:
                       result[key] = val
                   i += 1
               return result
-
-
+          
+          
           def seed_needs(flat):
               """Expose completed job outputs under needs.<job>.outputs.<key>.
               Cross-leg dependencies cannot be observed here; a missing outputs.version
@@ -300,8 +302,8 @@ jobs:
                   for k, v in outs.items():
                       flat["needs." + job_id + ".outputs." + k] = str(v)
               flat.setdefault("needs.create-release.outputs.version", REF_NAME)
-
-
+          
+          
           def collect_existing(paths):
               """Copy already-built files (referenced by a skipped publish step) into
               the bridge output directory so they still reach the Gitea release."""
@@ -320,11 +322,11 @@ jobs:
                           n += 1
                           break
               return n
-
-
+          
+          
           PUBLISH_RUN_RE = re.compile(r"(^|\n|\s|;|&&|\|\|)\s*gh\s+release\s+(create|upload|edit|delete|view)\b")
-
-
+          
+          
           def _parse_secrets():
               """Parse BRIDGE_SECRETS env var (KEY=value;KEY2=value2;) into a dict."""
               raw = os.environ.get("BRIDGE_SECRETS", "")
@@ -335,14 +337,14 @@ jobs:
                       if key.strip():
                           result[key.strip()] = val
               return result
-
-
+          
+          
           SECRETS = _parse_secrets()
           # GitHub always provides GITHUB_TOKEN; on the bridge it has no authority
           # (publishing goes to Gitea), but steps referencing it must still resolve.
           SECRETS.setdefault("GITHUB_TOKEN", "")
-
-
+          
+          
           def ctx_map(matrix=None, env=None):
               ros, arch = SLUG.split("-", 1)
               flat = {
@@ -364,12 +366,12 @@ jobs:
               for k, v in SECRETS.items():
                   flat["secrets." + k] = v
               return flat
-
-
+          
+          
           def _fmt(template, *args):
               return re.sub(r"\{(\d+)\}", lambda m: str(args[int(m.group(1))]), str(template))
-
-
+          
+          
           FUNCS = {
               "format": _fmt,
               "contains": lambda a, b: str(b) in str(a),
@@ -382,24 +384,24 @@ jobs:
               "always": lambda: True,
               "hashFiles": lambda *p: "",
           }
-
+          
           EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
           ALLOWED = re.compile(r"^[a-zA-Z0-9_$'\",().:!<>=%\-+*/ \[\]{}]*$")
-
-
+          
+          
           def _strip_expr_wrapper(s):
               """`if:` conditions may arrive as raw expressions or wrapped in
               the template delimiters; strip the wrapper before evaluating."""
               s = str(s).strip()
               m = re.match(r"^\$\{\{(.*)\}\}$", s, re.S)
               return m.group(1).strip() if m else s
-
-
+          
+          
           CTX_TOKEN_RE = re.compile(
               r"\b(matrix|env|secrets|github|runner|job|jobs|needs|steps|inputs|"
               r"vars|strategy)\.[A-Za-z0-9_.\-]+")
-
-
+          
+          
           def eval_expression(expr, flat):
               safe = expr.strip()
               # GitHub uses && || ! ; Python needs and or not
@@ -418,8 +420,8 @@ jobs:
               if not ALLOWED.match(safe):
                   raise ValueError("unsupported expression: " + expr)
               return eval(safe, {"__builtins__": {}}, {"__f": FUNCS})  # noqa: S307
-
-
+          
+          
           def interpolate(text, flat):
               def sub(m):
                   try:
@@ -430,8 +432,8 @@ jobs:
                           + m.group(0) + " (" + str(e)[:120] + ")")
                       return ""
               return EXPR_RE.sub(sub, str(text))
-
-
+          
+          
           def bootstrap(tool):
               def sh(cmd):
                   subprocess.run(cmd, shell=True, check=True)
@@ -455,8 +457,8 @@ jobs:
               elif tool in ("node", "python", "java", "dotnet"):
                   pass  # preinstalled
               log("setup-" + tool + ": ready (" + (shutil.which(tool) or "preinstalled") + ")")
-
-
+          
+          
           def collect_artifact(raw):
               for line in str(raw).replace(",", "\n").split("\n"):
                   line = line.strip()
@@ -470,8 +472,8 @@ jobs:
                       else:
                           shutil.copy2(matched, dest)
                       log("artifact collected: " + os.path.relpath(matched, SRC))
-
-
+          
+          
           def resolve_action(uses):
               m = re.match(r"^([^/@\s]+)/([^/@\s]+)(/[^@\s]+)?@(.+)$", uses)
               if not m:
@@ -492,8 +494,8 @@ jobs:
                   if r.returncode != 0:
                       sys.exit("cannot resolve action ref " + uses + ": " + r.stderr.strip())
               return os.path.join(dest, path.lstrip("/"))
-
-
+          
+          
           def run_uses(uses, withs, flat, job_env, depth):
               name = uses.split("@")[0]
               if name == "actions/checkout":
@@ -541,7 +543,7 @@ jobs:
               meta = yaml.safe_load(open(os.path.join(adir, meta_file), encoding="utf-8"))
               runs = (meta or {}).get("runs") or {}
               using = str(runs.get("using", ""))
-
+          
               if using.startswith("node"):
                   run_js_action(adir, meta, withs, flat)
                   return
@@ -550,7 +552,7 @@ jobs:
                   return
               if using != "composite":
                   sys.exit("unsupported action type '" + using + "' in " + uses)
-
+          
               declared = meta.get("inputs") or {}
               inputs = {}
               for key, spec in declared.items():
@@ -562,8 +564,8 @@ jobs:
               log("composite action " + uses + " (inputs: " + (str(inputs) or "none") + ")")
               for step in runs.get("steps") or []:
                   execute_step(step, inner, job_env, depth + 1, action_dir=adir)
-
-
+          
+          
           def run_js_action(adir, meta, withs, flat):
               """Execute a JavaScript action by running its entry point with Node,
               injecting the standard GitHub Actions runtime environment."""
@@ -595,8 +597,8 @@ jobs:
               r = subprocess.run([node, script], cwd=adir, env=env)
               if r.returncode != 0:
                   sys.exit("JS action failed with exit code " + str(r.returncode))
-
-
+          
+          
           def run_docker_action(adir, meta, withs, flat):
               """Execute a Docker action by building and running its image."""
               dockerfile = os.path.join(adir, meta.get("runs", {}).get("image", "Dockerfile"))
@@ -619,8 +621,8 @@ jobs:
               r = subprocess.run(cmd)
               if r.returncode != 0:
                   sys.exit("Docker action failed with exit code " + str(r.returncode))
-
-
+          
+          
           def _bash_cmd():
               """Resolve bash the way GitHub does: Git Bash on Windows (PATH lookup
               would find WSL's bash.exe, which has no distribution installed)."""
@@ -631,8 +633,8 @@ jobs:
                       if os.path.isfile(cand):
                           return [cand, "--noprofile", "--norc", "-e", "-o", "pipefail"]
               return ["bash", "-e", "-o", "pipefail"]
-
-
+          
+          
           def execute_step(step, flat, job_env, depth, action_dir=None):
               if "uses" in step:
                   withs = {}
@@ -738,8 +740,8 @@ jobs:
                       pass
               if r.returncode != 0:
                   sys.exit("step failed with exit code " + str(r.returncode))
-
-
+          
+          
           def expand_matrix(matrix):
               dims = {k: v for k, v in matrix.items()
                       if k not in ("include", "exclude") and isinstance(v, list)}
@@ -753,8 +755,8 @@ jobs:
                       combos = [c for c in combos
                                 if not all(str(c.get(k)) == str(v) for k, v in exc.items())]
               return combos
-
-
+          
+          
           def topo_order(jobs):
               ordered, done = [], set()
               remaining = list(jobs)
@@ -773,8 +775,8 @@ jobs:
                   if not progressed:
                       sys.exit("cycle detected in job needs: " + ", ".join(remaining))
               return ordered
-
-
+          
+          
           def start_services(services):
               """Start service containers (Linux runners only). Returns (env_dict, container_names)."""
               if not services or not SLUG.startswith("linux"):
@@ -808,14 +810,14 @@ jobs:
                   # Wait briefly for service to be reachable
                   subprocess.run(["sleep", "3"], check=False)
               return env, names
-
-
+          
+          
           def stop_services(names):
               for cname in names:
                   subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
                   log(f"service container {cname} stopped")
-
-
+          
+          
           def start_job_container(container_spec):
               """Start a job container (Linux only). Returns container name or None."""
               if not container_spec or not SLUG.startswith("linux"):
@@ -834,14 +836,14 @@ jobs:
                   return None
               log(f"container: started {image} as {cname}")
               return cname
-
-
+          
+          
           def stop_job_container(cname):
               if cname:
                   subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
                   log(f"container {cname} stopped")
-
-
+          
+          
           def _pat2re(pat):
               """Translate a GitHub branch/tag filter pattern to a regex. GitHub's
               matcher supports * ** ? [] and + (one or more of the preceding char),
@@ -881,8 +883,8 @@ jobs:
                       out.append(re.escape(c))
                       i += 1
               return "^" + "".join(out) + "$"
-
-
+          
+          
           def _trigger_matches(wf, is_tag):
               """Does this workflow's push trigger fire for the current ref?"""
               on = wf.get("on")
@@ -912,8 +914,8 @@ jobs:
               if not branches:
                   return True
               return any(re.match(_pat2re(b), REF_NAME) for b in branches)
-
-
+          
+          
           def _pick_workflow(files):
               """bridge.yml wins; otherwise prefer workflows whose push trigger fires
               for this ref (tag vs branch), then ones that produce artifacts."""
@@ -932,8 +934,8 @@ jobs:
                   scored.append((score, f))
               scored.sort(key=lambda x: (-x[0][0], -x[0][1], x[1]))
               return scored[0][1]
-
-
+          
+          
           def _reset_workspace():
               """Fresh-runner semantics between matrix combos: first call snapshots
               the pristine source workspace; later calls restore it and clear stale
@@ -987,8 +989,8 @@ jobs:
                               os.remove(p)
                           except OSError:
                               pass
-
-
+          
+          
           def main():
               files = sorted(glob.glob(os.path.join(SRC, ".github/workflows/*.yml")) +
                              glob.glob(os.path.join(SRC, ".github/workflows/*.yaml")))
@@ -1036,7 +1038,7 @@ jobs:
                                   continue
                           except Exception:  # noqa: BLE001
                               log("warning: cannot evaluate job if-condition, running: " + str(cond))
-
+          
                       # Start service containers and job container
                       combo_ran = combo_failed = False
                       svc_env, svc_names = start_services(job.get("services"))
@@ -1105,8 +1107,8 @@ jobs:
                   log("warning: job " + jname + " partial: " + str(ok)
                       + " combo(s) ok, " + str(bad) + " failed; publishing what built")
               log("done")
-
-
+          
+          
           def execute_step_in_container(step, flat, job_env, cname):
               """Execute a run: step inside a Docker container via docker exec."""
               if "uses" in step:
@@ -1126,8 +1128,8 @@ jobs:
               r = subprocess.run(cmd, cwd=SRC)
               if r.returncode != 0:
                   sys.exit("container step failed with exit code " + str(r.returncode))
-
-
+          
+          
           if __name__ == "__main__":
               try:
                   main()
