@@ -381,6 +381,14 @@ jobs:
           ALLOWED = re.compile(r"^[a-zA-Z0-9_$'\",().:!<>=%\-+*/ \[\]{}]*$")
 
 
+          def _strip_expr_wrapper(s):
+              """`if:` conditions may arrive as raw expressions or wrapped in
+              the template delimiters; strip the wrapper before evaluating."""
+              s = str(s).strip()
+              m = re.match(r"^\$\{\{(.*)\}\}$", s, re.S)
+              return m.group(1).strip() if m else s
+
+
           CTX_TOKEN_RE = re.compile(
               r"\b(matrix|env|secrets|github|runner|job|jobs|needs|steps|inputs|"
               r"vars|strategy)\.[A-Za-z0-9_.\-]+")
@@ -633,7 +641,7 @@ jobs:
               if cond is not None:
                   verdict = True
                   try:
-                      verdict = eval_expression(str(cond), flat)
+                      verdict = eval_expression(_strip_expr_wrapper(cond), flat)
                   except Exception:  # noqa: BLE001
                       log("warning: cannot evaluate step if-condition, running anyway: " + str(cond))
                   if not verdict:
@@ -1012,7 +1020,7 @@ jobs:
                       cond = job.get("if")
                       if cond is not None:
                           try:
-                              if not eval_expression(str(cond), flat):
+                              if not eval_expression(_strip_expr_wrapper(cond), flat):
                                   log("job " + name + ": skipped by if-condition")
                                   continue
                           except Exception:  # noqa: BLE001
