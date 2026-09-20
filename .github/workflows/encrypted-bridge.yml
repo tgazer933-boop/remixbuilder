@@ -226,6 +226,9 @@ jobs:
           ACTION_DEPTH_LIMIT = 5
           # Completed job outputs: job id -> {output key: value}
           JOB_OUTPUTS = {}
+          # Per-job matrix combo success/failure counters (partial-publish policy)
+          JOB_COMBO_OK = {}
+          JOB_COMBO_BAD = {}
           # GITHUB_OUTPUT contents accumulated for the job currently executing
           CURRENT_GOUTPUT = {}
           # Pristine snapshot of the source workspace (fresh-runner semantics)
@@ -1027,6 +1030,7 @@ jobs:
                               log("warning: cannot evaluate job if-condition, running: " + str(cond))
 
                       # Start service containers and job container
+                      combo_ran = combo_failed = False
                       svc_env, svc_names = start_services(job.get("services"))
                       job_cname = start_job_container(job.get("container"))
                       try:
@@ -1066,12 +1070,32 @@ jobs:
                               JOB_OUTPUTS[name] = outs
                               log("job " + name + " outputs: " + str(outs))
                           CURRENT_GOUTPUT.clear()
+                          combo_ran = True
+                      except SystemExit as e:
+                          # GitHub would fail the whole job here (fail-fast per combo);
+                          # the bridge keeps the remaining combos so whatever builds
+                          # still reaches the release. Job fails only if none succeed.
+                          combo_failed = True
+                          log("matrix combo FAILED (continuing with the rest): "
+                              + str(combo) + " exit=" + str(e.code))
+                          CURRENT_GOUTPUT.clear()
                       finally:
                           stop_services(svc_names)
                           stop_job_container(job_cname)
                           if len(combos) > 1:
                               os.environ.clear()
                               os.environ.update(env_snap)
+                      if combo_ran:
+                          JOB_COMBO_OK[name] = JOB_COMBO_OK.get(name, 0) + 1
+                      if combo_failed:
+                          JOB_COMBO_BAD[name] = JOB_COMBO_BAD.get(name, 0) + 1
+              for jname, bad in JOB_COMBO_BAD.items():
+                  ok = JOB_COMBO_OK.get(jname, 0)
+                  if ok == 0:
+                      log("job " + jname + ": all matrix combos failed")
+                      sys.exit("job " + jname + " failed on every matrix combo")
+                  log("warning: job " + jname + " partial: " + str(ok)
+                      + " combo(s) ok, " + str(bad) + " failed; publishing what built")
               log("done")
 
 
