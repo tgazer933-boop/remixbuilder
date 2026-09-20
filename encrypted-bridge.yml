@@ -1,0 +1,1359 @@
+name: encrypted-build-bridge
+run-name: bridge-${{ inputs.public_version }}-${{ inputs.recipe }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_urls:
+        required: true
+      transfer_sha256:
+        required: true
+      source_sha256:
+        required: true
+      public_version:
+        required: true
+      recipe:
+        required: true
+      expires_at:
+        required: true
+      request_sig:
+        required: true
+      output_age_recipient:
+        required: true
+      output_key_wrap:
+        required: true
+      output_pass_wrap:
+        required: true
+      platforms:
+        required: true
+      commit_sha:
+        required: false
+      repo_slug:
+        required: false
+      ref:
+        required: false
+      secrets_wrap:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: bridge-${{ inputs.public_version }}-${{ inputs.recipe }}
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      slugs: ${{ steps.mk.outputs.slugs }}
+    steps:
+      - name: Select platform matrix
+        id: mk
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          SELECT=$(python3 <<'PYSEL'
+          import json, os
+          m = {
+              "linux-amd64": "ubuntu-latest",
+              "linux-arm64": "ubuntu-24.04-arm",
+              "linux-amd64-cuda": "[self-hosted, linux, x64, cuda]",
+              "macos-amd64": "macos-15-intel",
+              "macos-arm64": "macos-latest",
+              "windows-amd64": "windows-latest",
+              "windows-arm64": "windows-11-arm",
+          }
+          items = [x for x in os.environ["PLATFORMS"].split(",") if x]
+          if not items or any(x not in m for x in items):
+              raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
+          print(json.dumps({"include": [{"slug": x, "image": m[x]} for x in items]}))
+          print(" ".join(items))
+          PYSEL
+          )
+          MATRIX=$(sed -n 1p <<<"$SELECT")
+          SLUGS=$(sed -n 2p <<<"$SELECT")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "slugs=$SLUGS" >> "$GITHUB_OUTPUT"
+          echo "selected: $MATRIX ($SLUGS)"
+
+  build:
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 180
+    permissions: {}
+    env:
+      SOURCE_URL: ${{ fromJSON(inputs.source_urls)[matrix.slug] }}
+      SOURCE_URLS_JSON: ${{ inputs.source_urls }}
+      TRANSFER_SHA256: ${{ inputs.transfer_sha256 }}
+      SOURCE_SHA256: ${{ inputs.source_sha256 }}
+      PUBLIC_VERSION: ${{ inputs.public_version }}
+      RECIPE: ${{ inputs.recipe }}
+      EXPIRES_AT: ${{ inputs.expires_at }}
+      REQUEST_SIG: ${{ inputs.request_sig }}
+      OUTPUT_AGE_RECIPIENT: ${{ inputs.output_age_recipient }}
+      OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
+      OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
+      PLATFORMS: ${{ inputs.platforms }}
+      SLUG: ${{ matrix.slug }}
+      CONTEXT_SHA: ${{ inputs.commit_sha }}
+      CONTEXT_REPO: ${{ inputs.repo_slug }}
+      CONTEXT_REF: ${{ inputs.ref || 'refs/heads/main' }}
+      SECRETS_WRAP: ${{ inputs.secrets_wrap }}
+
+    steps:
+      - name: Install bridge tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS:?}" in
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq age
+              ;;
+            macOS)
+              brew install age
+              ;;
+            Windows)
+              curl -fsSL --retry 3 -o "$RUNNER_TEMP/age.zip" \
+                "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
+              (cd "$RUNNER_TEMP" && /c/Windows/System32/tar.exe -xf age.zip)
+              echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+              export PATH="$RUNNER_TEMP/age:$PATH"
+              age --version
+              ;;
+          esac
+          age --version
+
+      - name: Prepare trusted bridge scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bridge"
+          cat > "$RUNNER_TEMP/bridge/verify.py" <<'PY'
+          import base64, hashlib, hmac, json, os, re, sys
+          from datetime import datetime, timezone
+          fields = [os.environ[x] for x in (
+              "SOURCE_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
+              "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
+              "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
+              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF"
+          )]
+          canonical = "v1\n" + "\n".join(fields)
+          expected = hmac.new(
+              os.environ["BRIDGE_SIGNING_KEY"].encode(),
+              canonical.encode(), hashlib.sha256
+          ).hexdigest()
+          supplied = os.environ["REQUEST_SIG"].lower()
+          if not hmac.compare_digest(expected, supplied):
+              raise SystemExit("invalid request signature")
+          urls = json.loads(os.environ["SOURCE_URLS_JSON"])
+          slugs = [x for x in os.environ["PLATFORMS"].split(",") if x]
+          if set(urls) != set(slugs):
+              raise SystemExit("slug/url mismatch")
+          for slug, url in urls.items():
+              if not url.startswith("http://47.104.2.255:3001/objects/"):
+                  raise SystemExit("invalid url for " + slug)
+          exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
+          if datetime.now(timezone.utc) >= exp:
+              raise SystemExit("request expired")
+          for name, pattern in (
+              ("TRANSFER_SHA256", 64), ("SOURCE_SHA256", 64),
+              ("PUBLIC_VERSION", 32), ("REQUEST_SIG", 64),
+          ):
+              value = os.environ[name]
+              if len(value) != pattern or any(c not in "0123456789abcdef" for c in value):
+                  raise SystemExit("invalid " + name)
+          if not (1 <= len(os.environ["RECIPE"]) <= 40) or not all(
+              c.isascii() and (c.isalnum() or c in "_-") for c in os.environ["RECIPE"]
+          ):
+              raise SystemExit("invalid recipe")
+          if not re.fullmatch(r"age1[0-9a-z]{40,80}", os.environ["OUTPUT_AGE_RECIPIENT"]):
+              raise SystemExit("invalid output_age_recipient")
+          for name in ("OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP"):
+              value = os.environ[name]
+              if not 24 <= len(value) <= 8192:
+                  raise SystemExit("invalid " + name)
+              try:
+                  base64.b64decode(value, validate=True)
+              except Exception:
+                  raise SystemExit("invalid " + name)
+          PY
+          chmod 700 "$RUNNER_TEMP/bridge/verify.py"
+          cat > $RUNNER_TEMP/bridge/exec.py <<'EXEC'
+          #!/usr/bin/env python3
+          # GitHub-Actions-compatible executor v2 for the encrypted bridge.
+          # Runs the repository's own .github/workflows/*.yml natively:
+          #   - trigger-aware workflow selection (tag pushes pick tag workflows)
+          #   - job matrix expansion (runs-on derived legs; combos run on their leg)
+          #   - needs topological ordering (same-leg; cross-leg auto-satisfied)
+          #     with same-leg job outputs (needs.<job>.outputs.<key>)
+          #   - expression subset: github.sha/ref/ref_name/repository/workspace,
+          #     matrix.*, env.*, runner.os/arch, job.status, format/contains/
+          #     startsWith/endsWith/join/toJSON, success()/failure()/always()
+          #   - GITHUB_ENV / GITHUB_PATH / GITHUB_OUTPUT file semantics
+          #   - uses: composite actions cloned and executed recursively; checkout/cache
+          #     no-op; setup-* bootstrapped (incl. dtolnay/rust-toolchain with
+          #     toolchain/target inputs); upload-artifact collected; release-publishing
+          #     steps (gh release *, softprops/action-gh-release, attestations) are
+          #     skipped and their files collected - the bridge publishes to Gitea
+          import glob
+          import itertools
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          
+          import yaml
+          
+          SLUG = os.environ["SLUG"]
+          SRC = os.environ.get("BRIDGE_SRC", os.getcwd())
+          OUT = os.environ["BRIDGE_OUTPUT_DIR"]
+          CONTEXT_SHA = os.environ.get("CONTEXT_SHA", "")
+          CONTEXT_REPO = os.environ.get("CONTEXT_REPO", "")
+          CONTEXT_REF = os.environ.get("CONTEXT_REF", "")
+          REF_NAME = re.sub(r"^refs/(tags|heads)/", "", CONTEXT_REF)
+          IS_TAG = CONTEXT_REF.startswith("refs/tags/")
+          JOB_STATUS = "success"
+          ACTION_DEPTH_LIMIT = 5
+          # Completed job outputs: job id -> {output key: value}
+          JOB_OUTPUTS = {}
+          # Per-job matrix combo success/failure counters (partial-publish policy)
+          JOB_COMBO_OK = {}
+          JOB_COMBO_BAD = {}
+          # GITHUB_OUTPUT contents accumulated for the job currently executing
+          CURRENT_GOUTPUT = {}
+          # Pristine snapshot of the source workspace (fresh-runner semantics)
+          PRISTINE = None
+          # RUNNER_TEMP listing captured before the first combo: pre-installed tools
+          # (e.g. age on windows) live here and must survive combo resets
+          TEMP_SNAPSHOT = None
+          # Temp entries that belong to the bridge itself and must survive resets
+          TEMP_KEEP = ("bridge", "output")
+          # Actions whose only purpose is publishing to GitHub; the bridge publishes
+          # to Gitea itself, so these are skipped instead of run.
+          PUBLISH_USES = {
+              "softprops/action-gh-release", "ncipollo/release-action",
+              "marvinpinto/action-automatic-releases", "release-drafter/release-drafter",
+              "actions/attest-build-provenance",
+          }
+          
+          LABEL2SLUG = {
+              "ubuntu-latest": "linux-amd64", "ubuntu-24.04": "linux-amd64",
+              "ubuntu-22.04": "linux-amd64", "ubuntu-latest-arm64": "linux-arm64",
+              "ubuntu-24.04-arm": "linux-arm64", "ubuntu-22.04-arm": "linux-arm64",
+              "macos-latest": "macos-arm64", "macos-15": "macos-arm64",
+              "macos-14": "macos-arm64", "macos-13": "macos-amd64",
+              "macos-15-intel": "macos-amd64",
+              "windows-latest": "windows-amd64", "windows-2025": "windows-amd64",
+              "windows-2022": "windows-amd64",
+          }
+          SLUG2RUNNER_OS = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
+          SLUG2ARCH = {"amd64": "X64", "arm64": "ARM64"}
+          
+          
+          def log(msg):
+              print("[bridge-exec] " + msg, flush=True)
+          
+          
+          def _parse_kv_file(path):
+              """Parse a GITHUB_ENV/GITHUB_OUTPUT style file (KEY=value lines and the
+              multiline KEY<<delim form). Returns a dict."""
+              result = {}
+              try:
+                  lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+              except OSError:
+                  return result
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)<<(.+)$", line)
+                  if m:
+                      key, delim = m.group(1), m.group(2)
+                      vals = []
+                      i += 1
+                      while i < len(lines) and lines[i] != delim:
+                          vals.append(lines[i])
+                          i += 1
+                      result[key] = "\n".join(vals)
+                  elif "=" in line:
+                      key, _, val = line.partition("=")
+                      result[key] = val
+                  i += 1
+              return result
+          
+          
+          def seed_needs(flat):
+              """Expose completed job outputs under needs.<job>.outputs.<key>.
+              Cross-leg dependencies cannot be observed here; a missing outputs.version
+              falls back to the pushed tag/branch name (the overwhelmingly common use).
+              """
+              for job_id, outs in JOB_OUTPUTS.items():
+                  for k, v in outs.items():
+                      flat["needs." + job_id + ".outputs." + k] = str(v)
+              flat.setdefault("needs.create-release.outputs.version", REF_NAME)
+          
+          
+          def collect_existing(paths):
+              """Copy already-built files (referenced by a skipped publish step) into
+              the bridge output directory so they still reach the Gitea release."""
+              n = 0
+              for raw in paths:
+                  p = raw.strip().strip('"').strip("'")
+                  if not p or p.startswith("-"):
+                      continue
+                  for base in (SRC, os.getcwd()):
+                      full = p if os.path.isabs(p) else os.path.join(base, p)
+                      if os.path.isfile(full):
+                          dest = os.path.join(OUT, os.path.basename(full))
+                          os.makedirs(OUT, exist_ok=True)
+                          shutil.copy2(full, dest)
+                          log("artifact collected (from publish step): " + os.path.basename(full))
+                          n += 1
+                          break
+              return n
+          
+          
+          PUBLISH_RUN_RE = re.compile(r"(^|\n|\s|;|&&|\|\|)\s*gh\s+release\s+(create|upload|edit|delete|view)\b")
+          
+          
+          def _parse_secrets():
+              """Parse BRIDGE_SECRETS env var (KEY=value;KEY2=value2;) into a dict."""
+              raw = os.environ.get("BRIDGE_SECRETS", "")
+              result = {}
+              for pair in raw.split(";"):
+                  if "=" in pair:
+                      key, _, val = pair.partition("=")
+                      if key.strip():
+                          result[key.strip()] = val
+              return result
+          
+          
+          SECRETS = _parse_secrets()
+          # GitHub always provides GITHUB_TOKEN; on the bridge it has no authority
+          # (publishing goes to Gitea), but steps referencing it must still resolve.
+          SECRETS.setdefault("GITHUB_TOKEN", "")
+          
+          
+          def ctx_map(matrix=None, env=None):
+              ros, arch = SLUG.split("-", 1)
+              flat = {
+                  "github.sha": CONTEXT_SHA,
+                  "github.ref": CONTEXT_REF,
+                  "github.ref_name": REF_NAME,
+                  "github.ref_type": "tag" if IS_TAG else "branch",
+                  "github.repository": CONTEXT_REPO,
+                  "github.workspace": SRC,
+                  "github.event_name": "push",
+                  "runner.os": SLUG2RUNNER_OS.get(ros, ros),
+                  "runner.arch": SLUG2ARCH.get(arch, arch),
+                  "job.status": JOB_STATUS,
+              }
+              for k, v in (matrix or {}).items():
+                  flat["matrix." + k] = v
+              for k, v in (env or {}).items():
+                  flat["env." + k] = v
+              for k, v in SECRETS.items():
+                  flat["secrets." + k] = v
+              return flat
+          
+          
+          def _fmt(template, *args):
+              return re.sub(r"\{(\d+)\}", lambda m: str(args[int(m.group(1))]), str(template))
+          
+          
+          FUNCS = {
+              "format": _fmt,
+              "contains": lambda a, b: str(b) in str(a),
+              "startsWith": lambda a, b: str(a).startswith(str(b)),
+              "endsWith": lambda a, b: str(a).endswith(str(b)),
+              "join": lambda l, sep=",": sep.join(str(x) for x in l),
+              "toJSON": lambda v: json.dumps(v),
+              "success": lambda: JOB_STATUS == "success",
+              "failure": lambda: JOB_STATUS != "success",
+              "always": lambda: True,
+              "hashFiles": lambda *p: "",
+          }
+          
+          EXPR_RE = re.compile(r"\$\{\{(.+?)\}\}")
+          ALLOWED = re.compile(r"^[a-zA-Z0-9_$'\",().:!<>=%\-+*/ \[\]{}]*$")
+          
+          
+          def _strip_expr_wrapper(s):
+              """`if:` conditions may arrive as raw expressions or wrapped in
+              the template delimiters; strip the wrapper before evaluating."""
+              s = str(s).strip()
+              m = re.match(r"^\$\{\{(.*)\}\}$", s, re.S)
+              return m.group(1).strip() if m else s
+          
+          
+          CTX_TOKEN_RE = re.compile(
+              r"\b(matrix|env|secrets|github|runner|job|jobs|needs|steps|inputs|"
+              r"vars|strategy)\.[A-Za-z0-9_.\-]+")
+          
+          
+          def eval_expression(expr, flat):
+              safe = expr.strip()
+              # GitHub uses && || ! ; Python needs and or not
+              safe = re.sub(r"&&", " and ", safe)
+              safe = re.sub(r"\|\|", " or ", safe)
+              safe = re.sub(r"(?<![\w'\")])!(?!=)", " not ", safe)
+              # Context references absent from flat resolve to empty strings, exactly
+              # like GitHub (e.g. matrix keys not defined for this combo).
+              safe = CTX_TOKEN_RE.sub(
+                  lambda m: m.group(0) if m.group(0) in flat else "''", safe)
+              for path in sorted(flat, key=len, reverse=True):
+                  safe = re.sub(r"(?<![\w.])" + re.escape(path) + r"(?![\w])",
+                                repr(str(flat[path])), safe)
+              safe = re.sub(r"\b(?<!')(format|contains|startsWith|endsWith|join|toJSON|"
+                            r"success|failure|always|hashFiles)\(", r"__f['\1'](", safe)
+              if not ALLOWED.match(safe):
+                  raise ValueError("unsupported expression: " + expr)
+              return eval(safe, {"__builtins__": {}}, {"__f": FUNCS})  # noqa: S307
+          
+          
+          def interpolate(text, flat):
+              def sub(m):
+                  try:
+                      return str(eval_expression(m.group(1), flat))
+                  except Exception as e:  # noqa: BLE001
+                      # GitHub resolves unknown context to empty; never kill the build.
+                      log("warning: unresolved expression, substituting empty: "
+                          + m.group(0) + " (" + str(e)[:120] + ")")
+                      return ""
+              return EXPR_RE.sub(sub, str(text))
+          
+          
+          def bootstrap(tool):
+              def sh(cmd):
+                  subprocess.run(cmd, shell=True, check=True)
+              if tool == "go" and not shutil.which("go"):
+                  ver = subprocess.run(
+                      ["curl", "-fsSL", "--retry", "3", "https://go.dev/VERSION?m=text"],
+                      capture_output=True, text=True, check=True).stdout.split("\n")[0]
+                  if not re.match(r"^go\d+\.\d+", ver or ""):
+                      ver = "go1.27.1"
+                  arch = "arm64" if os.uname().machine == "aarch64" else "amd64"
+                  sub = {"linux": "linux", "darwin": "darwin"}.get(SLUG.split("-")[0], "linux")
+                  w = tempfile.mkdtemp()
+                  url = "https://dl.google.com/go/" + ver + "." + sub + "-" + arch + ".tar.gz"
+                  sh('curl -fsSL --retry 3 "' + url + '" | tar -C "' + w + '" -xz')
+                  os.environ["PATH"] = w + "/go/bin" + os.pathsep + os.environ["PATH"]
+              elif tool == "rust" and not shutil.which("cargo"):
+                  sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
+                     "sh -s -- -y -q --profile minimal --default-toolchain stable")
+                  os.environ["PATH"] = (os.path.join(os.path.expanduser("~"), ".cargo", "bin")
+                                        + os.pathsep + os.environ["PATH"])
+              elif tool in ("node", "python", "java", "dotnet"):
+                  pass  # preinstalled
+              log("setup-" + tool + ": ready (" + (shutil.which(tool) or "preinstalled") + ")")
+          
+          
+          def collect_artifact(raw):
+              for line in str(raw).replace(",", "\n").split("\n"):
+                  line = line.strip()
+                  if not line:
+                      continue
+                  for matched in sorted(glob.glob(os.path.join(SRC, line))):
+                      dest = os.path.join(OUT, os.path.relpath(matched, SRC))
+                      os.makedirs(os.path.dirname(dest), exist_ok=True)
+                      if os.path.isdir(matched):
+                          shutil.copytree(matched, dest, dirs_exist_ok=True)
+                      else:
+                          shutil.copy2(matched, dest)
+                      log("artifact collected: " + os.path.relpath(matched, SRC))
+          
+          
+          def resolve_action(uses):
+              m = re.match(r"^([^/@\s]+)/([^/@\s]+)(/[^@\s]+)?@(.+)$", uses)
+              if not m:
+                  sys.exit("cannot parse action reference: " + uses)
+              owner, repo, path, ref = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+              dest = tempfile.mkdtemp(prefix="action-")
+              url = "https://github.com/" + owner + "/" + repo
+              r = subprocess.run(["git", "clone", "-q", "--filter=blob:none", url, dest],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  sys.exit("cannot clone action " + url + ": " + r.stderr.strip())
+              r = subprocess.run(["git", "-C", dest, "checkout", "-q", ref],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  subprocess.run(["git", "-C", dest, "fetch", "-q", "origin", ref], check=False)
+                  r = subprocess.run(["git", "-C", dest, "checkout", "-q", "FETCH_HEAD"],
+                                     capture_output=True, text=True)
+                  if r.returncode != 0:
+                      sys.exit("cannot resolve action ref " + uses + ": " + r.stderr.strip())
+              return os.path.join(dest, path.lstrip("/"))
+          
+          
+          def run_uses(uses, withs, flat, job_env, depth):
+              name = uses.split("@")[0]
+              if name == "actions/checkout":
+                  log("checkout: skipped (source delivered by the encrypted bridge)")
+                  return
+              if name in ("actions/cache", "actions/cache/restore", "actions/cache/save"):
+                  log("cache: no-op on the bridge")
+                  return
+              if name == "actions/upload-artifact":
+                  collect_artifact(interpolate(withs.get("path", ""), flat))
+                  return
+              if name in ("actions/setup-node", "actions/setup-python",
+                          "actions/setup-java", "actions/setup-dotnet"):
+                  bootstrap(name.split("-")[1])
+                  return
+              if name == "actions/setup-go":
+                  bootstrap("go")
+                  return
+              if name in ("dtolnay/rust-toolchain", "actions-rust-lang/setup-rust-toolchain"):
+                  bootstrap("rust")
+                  tc = str(withs.get("toolchain") or withs.get("toolchains") or "").strip()
+                  tc = tc.split(",")[0].strip() or "stable"
+                  tgt = str(withs.get("target") or withs.get("targets") or "").strip()
+                  tgt = tgt.split(",")[0].strip()
+                  cmd = ["rustup", "toolchain", "install", tc, "--profile", "minimal"]
+                  if tgt:
+                      cmd += ["--target", tgt]
+                  r = subprocess.run(cmd, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      log("warning: rustup install failed: " + r.stderr.strip()[:200])
+                  os.environ["RUSTUP_TOOLCHAIN"] = tc
+                  log("rust toolchain ready: " + tc + (" +" + tgt if tgt else ""))
+                  return
+              if name in PUBLISH_USES or any(name == p or name.startswith(p + "/")
+                                             for p in PUBLISH_USES):
+                  log("publish action skipped (the bridge publishes to Gitea): " + uses)
+                  return
+              if depth >= ACTION_DEPTH_LIMIT:
+                  sys.exit("action nesting too deep")
+              adir = resolve_action(uses)
+              meta_file = next((f for f in ("action.yml", "action.yaml")
+                                if os.path.isfile(os.path.join(adir, f))), None)
+              if not meta_file:
+                  sys.exit("unsupported action (no metadata): " + uses)
+              meta = yaml.safe_load(open(os.path.join(adir, meta_file), encoding="utf-8"))
+              runs = (meta or {}).get("runs") or {}
+              using = str(runs.get("using", ""))
+          
+              if using.startswith("node"):
+                  run_js_action(adir, meta, withs, flat)
+                  return
+              if using.startswith("docker"):
+                  run_docker_action(adir, meta, withs, flat)
+                  return
+              if using != "composite":
+                  sys.exit("unsupported action type '" + using + "' in " + uses)
+          
+              declared = meta.get("inputs") or {}
+              inputs = {}
+              for key, spec in declared.items():
+                  val = withs.get(key, (spec or {}).get("default", ""))
+                  inputs[key] = interpolate(val, flat) if isinstance(val, str) else val
+              inner = dict(flat)
+              for k, v in inputs.items():
+                  inner["inputs." + k] = v
+              log("composite action " + uses + " (inputs: " + (str(inputs) or "none") + ")")
+              for step in runs.get("steps") or []:
+                  execute_step(step, inner, job_env, depth + 1, action_dir=adir)
+          
+          
+          def run_js_action(adir, meta, withs, flat):
+              """Execute a JavaScript action by running its entry point with Node,
+              injecting the standard GitHub Actions runtime environment."""
+              entry = meta.get("runs", {}).get("main", "dist/index.js")
+              script = os.path.join(adir, entry)
+              if not os.path.isfile(script):
+                  sys.exit("JS action entry point not found: " + entry)
+              node = shutil.which("node")
+              if not node:
+                  sys.exit("node not available for JS action")
+              env = dict(os.environ)
+              env["GITHUB_WORKSPACE"] = SRC
+              env["GITHUB_ACTION"] = os.path.basename(adir)
+              env["GITHUB_ACTIONS"] = "true"
+              env["RUNNER_TEMP"] = os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
+              env["RUNNER_OS"] = flat.get("runner.os", "Linux")
+              for k, v in flat.items():
+                  env["GITHUB_CTX_" + k.replace(".", "_").upper()] = str(v)
+              declared = meta.get("inputs") or {}
+              for key, spec in declared.items():
+                  val = withs.get(key, (spec or {}).get("default", ""))
+                  val = interpolate(val, flat) if isinstance(val, str) else str(val)
+                  env["INPUT_" + key.replace(" ", "_").upper()] = val
+              for k, v in (os.environ.get("BRIDGE_SECRETS", "") or "").split(";"):
+                  if "=" in v:
+                      env["SECRET_" + v.split("=", 1)[0]] = v.split("=", 1)[1]
+              log("JS action: node " + entry + " (inputs: " +
+                  str({k: v for k, v in env.items() if k.startswith("INPUT_")}) + ")")
+              r = subprocess.run([node, script], cwd=adir, env=env)
+              if r.returncode != 0:
+                  sys.exit("JS action failed with exit code " + str(r.returncode))
+          
+          
+          def run_docker_action(adir, meta, withs, flat):
+              """Execute a Docker action by building and running its image."""
+              dockerfile = os.path.join(adir, meta.get("runs", {}).get("image", "Dockerfile"))
+              if not os.path.isfile(dockerfile):
+                  sys.exit("Docker action image not found")
+              tag = "bridge-action-" + os.path.basename(adir).lower()
+              r = subprocess.run(["docker", "build", "-q", "-t", tag, adir],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  sys.exit("docker build failed: " + r.stderr.strip())
+              env_args = []
+              declared = meta.get("inputs") or {}
+              for key, spec in declared.items():
+                  val = withs.get(key, (spec or {}).get("default", ""))
+                  val = interpolate(val, flat) if isinstance(val, str) else str(val)
+                  env_args += ["-e", "INPUT_" + key.replace(" ", "_").upper() + "=" + val]
+              env_args += ["-e", "GITHUB_WORKSPACE=/workspace"]
+              cmd = ["docker", "run", "--rm"] + env_args + ["-v", SRC + ":/workspace", tag]
+              log("Docker action: " + " ".join(cmd[:6]) + "...")
+              r = subprocess.run(cmd)
+              if r.returncode != 0:
+                  sys.exit("Docker action failed with exit code " + str(r.returncode))
+          
+          
+          def _bash_cmd():
+              """Resolve bash the way GitHub does: Git Bash on Windows (PATH lookup
+              would find WSL's bash.exe, which has no distribution installed)."""
+              if sys.platform == "win32" or SLUG.startswith("windows"):
+                  for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                               r"C:\Program Files\Git\usr\bin\bash.exe",
+                               r"C:\Program Files (x86)\Git\bin\bash.exe"):
+                      if os.path.isfile(cand):
+                          return [cand, "--noprofile", "--norc", "-e", "-o", "pipefail"]
+              return ["bash", "-e", "-o", "pipefail"]
+          
+          
+          def execute_step(step, flat, job_env, depth, action_dir=None):
+              if "uses" in step:
+                  withs = {}
+                  for k, v in (step.get("with") or {}).items():
+                      withs[k] = interpolate(v, flat) if isinstance(v, str) else v
+                  run_uses(step["uses"], withs, flat, job_env, depth)
+                  return
+              script = step.get("run")
+              if script is None:
+                  return
+              cond = step.get("if")
+              if cond is not None:
+                  verdict = True
+                  try:
+                      verdict = eval_expression(_strip_expr_wrapper(cond), flat)
+                  except Exception:  # noqa: BLE001
+                      log("warning: cannot evaluate step if-condition, running anyway: " + str(cond))
+                  if not verdict:
+                      log("step skipped by if-condition: " + str(step.get("name") or "run"))
+                      return
+              shell = step.get("shell") or "bash"
+              step_env_raw = {}
+              for k, v in (step.get("env") or {}).items():
+                  step_env_raw[k] = str(v)
+              step_flat = dict(flat)
+              for k, v in step_env_raw.items():
+                  step_flat["env." + k] = v
+              seed_needs(step_flat)
+              script = interpolate(script, step_flat)
+              env = dict(job_env)
+              for k, v in step_env_raw.items():
+                  try:
+                      env[k] = interpolate(v, step_flat)
+                  except ValueError as e:  # noqa: BLE001
+                      log("warning: step env " + k + " unresolved, using empty: " + str(e))
+                      env[k] = ""
+              for k, v in (step.get("env") or {}).items():
+                  try:
+                      env[k] = interpolate(v, flat) if isinstance(v, str) else str(v)
+                  except ValueError as e:  # noqa: BLE001
+                      log("warning: step env " + k + " unresolved, using empty: " + str(e))
+                      env[k] = ""
+              if PUBLISH_RUN_RE.search(script):
+                  n = 0
+                  for line in script.splitlines():
+                      if re.search(r"\bgh\s+release\s+upload\b", line):
+                          toks = [t for t in line.split()
+                                  if t not in ("gh", "release", "upload")]
+                          n += collect_existing(toks[1:])  # first token is the tag
+                  log("step skipped (publishing handled by the bridge"
+                      + (", collected " + str(n) + " files" if n else "") + "): "
+                      + str(step.get("name") or "run"))
+                  return
+              full = dict(os.environ)
+              full.update(env)
+              for k, v in SECRETS.items():
+                  full[k] = v
+              # GitHub Actions file-mediated variables
+              env_file = tempfile.mktemp(prefix="benv-")
+              path_file = tempfile.mktemp(prefix="bpath-")
+              out_file = tempfile.mktemp(prefix="bout-")
+              for f in (env_file, path_file, out_file):
+                  open(f, "w", encoding="utf-8").close()
+              full["GITHUB_ENV"] = env_file
+              full["GITHUB_PATH"] = path_file
+              full["GITHUB_OUTPUT"] = out_file
+              wd = step.get("working-directory")
+              cwd = os.path.join(SRC, wd) if wd else SRC
+              if shell in ("bash", "sh"):
+                  cmd = _bash_cmd() + ["-c", script]
+              elif shell in ("pwsh", "powershell"):
+                  cmd = ["pwsh", "-Command", script]
+              else:
+                  sys.exit("unsupported shell: " + str(shell))
+              timeout = None
+              tm = step.get("timeout-minutes")
+              try:
+                  if tm:
+                      timeout = float(tm) * 60
+              except (TypeError, ValueError):
+                  timeout = None
+              r = subprocess.run(cmd, cwd=cwd, env=full, timeout=timeout)
+              # Fold GITHUB_ENV / GITHUB_PATH / GITHUB_OUTPUT back in for later steps.
+              for k, v in _parse_kv_file(env_file).items():
+                  job_env[k] = v
+                  flat["env." + k] = v
+                  os.environ[k] = v
+                  log("GITHUB_ENV " + k + " set")
+              try:
+                  with open(path_file, encoding="utf-8", errors="replace") as fh:
+                      for line in fh.read().splitlines():
+                          line = line.strip()
+                          if line and os.path.isdir(line):
+                              os.environ["PATH"] = line + os.pathsep + os.environ["PATH"]
+                              log("GITHUB_PATH +" + line)
+              except OSError:
+                  pass
+              CURRENT_GOUTPUT.update(_parse_kv_file(out_file))
+              for f in (env_file, path_file, out_file):
+                  try:
+                      os.remove(f)
+                  except OSError:
+                      pass
+              if r.returncode != 0:
+                  sys.exit("step failed with exit code " + str(r.returncode))
+          
+          
+          def expand_matrix(matrix):
+              dims = {k: v for k, v in matrix.items()
+                      if k not in ("include", "exclude") and isinstance(v, list)}
+              combos = [dict(zip(dims, vals))
+                        for vals in itertools.product(*dims.values())] if dims else [{}]
+              for inc in matrix.get("include") or []:
+                  if isinstance(inc, dict):
+                      combos.append(dict(inc))
+              for exc in matrix.get("exclude") or []:
+                  if isinstance(exc, dict):
+                      combos = [c for c in combos
+                                if not all(str(c.get(k)) == str(v) for k, v in exc.items())]
+              return combos
+          
+          
+          def topo_order(jobs):
+              ordered, done = [], set()
+              remaining = list(jobs)
+              while remaining:
+                  progressed = False
+                  for name in list(remaining):
+                      needs = (jobs[name].get("needs") or [])
+                      if not isinstance(needs, list):
+                          needs = [needs]
+                      deps = [d for d in needs if d in remaining and d not in done]
+                      if not deps:
+                          ordered.append(name)
+                          done.add(name)
+                          remaining.remove(name)
+                          progressed = True
+                  if not progressed:
+                      sys.exit("cycle detected in job needs: " + ", ".join(remaining))
+              return ordered
+          
+          
+          def start_services(services):
+              """Start service containers (Linux runners only). Returns (env_dict, container_names)."""
+              if not services or not SLUG.startswith("linux"):
+                  if services:
+                      log("services: skipped (only supported on Linux legs)")
+                  return {}, []
+              env = {}
+              names = []
+              for svc_name, svc in services.items():
+                  image = svc.get("image", "")
+                  if not image:
+                      continue
+                  cname = "bridge-svc-" + re.sub(r"[^a-zA-Z0-9_-]", "", svc_name)
+                  ports = svc.get("ports") or []
+                  port_args = []
+                  for p in ports:
+                      port_args += ["-p", str(p)]
+                  env_args = []
+                  for k, v in (svc.get("env") or {}).items():
+                      env_args += ["-e", f"{k}={v}"]
+                  cmd = ["docker", "run", "-d", "--name", cname] + port_args + env_args + [image]
+                  r = subprocess.run(cmd, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      log(f"service {svc_name}: failed to start ({r.stderr.strip()[:80]})")
+                      continue
+                  names.append(cname)
+                  env[f"{svc_name.upper().replace('-', '_')}_HOST"] = "127.0.0.1"
+                  if ports:
+                      env[f"{svc_name.upper().replace('-', '_')}_PORT"] = str(ports[0]).split(":")[0]
+                  log(f"service {svc_name}: started ({image}, ports={ports})")
+                  # Wait briefly for service to be reachable
+                  subprocess.run(["sleep", "3"], check=False)
+              return env, names
+          
+          
+          def stop_services(names):
+              for cname in names:
+                  subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
+                  log(f"service container {cname} stopped")
+          
+          
+          def start_job_container(container_spec):
+              """Start a job container (Linux only). Returns container name or None."""
+              if not container_spec or not SLUG.startswith("linux"):
+                  if container_spec:
+                      log("container: skipped (only supported on Linux legs)")
+                  return None
+              image = container_spec if isinstance(container_spec, str) else container_spec.get("image", "")
+              if not image:
+                  return None
+              cname = "bridge-job-" + os.getpid().__str__()
+              cmd = ["docker", "run", "-d", "--name", cname,
+                     "-v", SRC + ":/workspace", "-w", "/workspace", image, "sleep", "infinity"]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0:
+                  log(f"container: failed to start ({r.stderr.strip()[:80]})")
+                  return None
+              log(f"container: started {image} as {cname}")
+              return cname
+          
+          
+          def stop_job_container(cname):
+              if cname:
+                  subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
+                  log(f"container {cname} stopped")
+          
+          
+          def _pat2re(pat):
+              """Translate a GitHub branch/tag filter pattern to a regex. GitHub's
+              matcher supports * ** ? [] and + (one or more of the preceding char),
+              which fnmatch does not."""
+              out = []
+              i = 0
+              pat = str(pat)
+              while i < len(pat):
+                  c = pat[i]
+                  if c == "[":
+                      j = pat.find("]", i + 1)
+                      if j == -1:
+                          out.append(re.escape(c))
+                          i += 1
+                          continue
+                      inner = pat[i + 1:j]
+                      neg = inner[:1] in ("!", "^")
+                      if neg:
+                          inner = inner[1:]
+                      out.append(("[^" if neg else "[") + inner + "]")
+                      i = j + 1
+                  elif c == "*":
+                      if pat[i:i + 2] == "**":
+                          out.append(".*")
+                          i += 2
+                      else:
+                          out.append("[^/]*")
+                          i += 1
+                  elif c == "?":
+                      out.append("[^/]")
+                      i += 1
+                  elif c == "+":
+                      if out:
+                          out[-1] += "+"
+                      i += 1
+                  else:
+                      out.append(re.escape(c))
+                      i += 1
+              return "^" + "".join(out) + "$"
+          
+          
+          def _trigger_matches(wf, is_tag):
+              """Does this workflow's push trigger fire for the current ref?"""
+              on = wf.get("on")
+              if on is None and True in wf:  # pyyaml parses a bare `on:` as True
+                  on = wf[True]
+              if isinstance(on, bool) or on is None:
+                  on = {}
+              if isinstance(on, str):
+                  return on == "push" and not is_tag
+              if isinstance(on, list):
+                  if "push" not in on:
+                      return False
+                  on = {}
+              if not isinstance(on, dict):
+                  return False
+              push = on.get("push")
+              if push is None:
+                  return "push" in on or not on
+              if not isinstance(push, dict):
+                  return True
+              if is_tag:
+                  tags = push.get("tags")
+                  if not tags:
+                      return False
+                  return any(re.match(_pat2re(t), REF_NAME) for t in tags)
+              branches = push.get("branches")
+              if not branches:
+                  return True
+              return any(re.match(_pat2re(b), REF_NAME) for b in branches)
+          
+          
+          def _pick_workflow(files):
+              """bridge.yml wins; otherwise prefer workflows whose push trigger fires
+              for this ref (tag vs branch), then ones that produce artifacts."""
+              preferred = [f for f in files if os.path.basename(f) == "bridge.yml"]
+              if preferred:
+                  return preferred[0]
+              scored = []
+              for f in files:
+                  try:
+                      wf = yaml.safe_load(open(f, encoding="utf-8")) or {}
+                  except Exception:  # noqa: BLE001
+                      continue
+                  body = open(f, encoding="utf-8", errors="replace").read()
+                  score = (1 if _trigger_matches(wf, IS_TAG) else 0,
+                           1 if "upload-artifact" in body else 0)
+                  scored.append((score, f))
+              scored.sort(key=lambda x: (-x[0][0], -x[0][1], x[1]))
+              return scored[0][1]
+          
+          
+          def _reset_workspace():
+              """Fresh-runner semantics between matrix combos: first call snapshots
+              the pristine source workspace; later calls restore it and clear stale
+              RUNNER_TEMP entries (bridge scripts and collected output are kept)."""
+              global PRISTINE
+              if PRISTINE is None:
+                  PRISTINE = tempfile.mkdtemp(prefix=".bridge-pristine-",
+                                              dir=os.path.expanduser("~"))
+                  for entry in os.listdir(SRC):
+                      s, d = os.path.join(SRC, entry), os.path.join(PRISTINE, entry)
+                      if os.path.isdir(s) and not os.path.islink(s):
+                          shutil.copytree(s, d, symlinks=True)
+                      else:
+                          shutil.copy2(s, d, follow_symlinks=False)
+                  return
+              for entry in os.listdir(SRC):
+                  p = os.path.join(SRC, entry)
+                  if os.path.isdir(p) and not os.path.islink(p):
+                      shutil.rmtree(p, ignore_errors=True)
+                  else:
+                      try:
+                          os.remove(p)
+                      except OSError:
+                          pass
+              for entry in os.listdir(PRISTINE):
+                  s, d = os.path.join(PRISTINE, entry), os.path.join(SRC, entry)
+                  if os.path.isdir(s) and not os.path.islink(s):
+                      shutil.copytree(s, d, symlinks=True)
+                  else:
+                      shutil.copy2(s, d, follow_symlinks=False)
+              rt = os.environ.get("RUNNER_TEMP")
+              if rt and os.path.isdir(rt):
+                  global TEMP_SNAPSHOT
+                  if TEMP_SNAPSHOT is None:
+                      TEMP_SNAPSHOT = set(os.listdir(rt))
+                  src_abs = os.path.abspath(SRC)
+                  keep_abs = [src_abs, os.path.abspath(PRISTINE)]
+                  for entry in os.listdir(rt):
+                      # never touch pre-existing tool installs or bridge outputs
+                      if (entry in TEMP_SNAPSHOT or entry in TEMP_KEEP
+                              or entry.startswith("output-")):
+                          continue
+                      p = os.path.abspath(os.path.join(rt, entry))
+                      # never delete the workspace or the pristine snapshot itself
+                      if any(p == k or k.startswith(p + os.sep) for k in keep_abs):
+                          continue
+                      if os.path.isdir(p) and not os.path.islink(p):
+                          shutil.rmtree(p, ignore_errors=True)
+                      else:
+                          try:
+                              os.remove(p)
+                          except OSError:
+                              pass
+          
+          
+          def main():
+              files = sorted(glob.glob(os.path.join(SRC, ".github/workflows/*.yml")) +
+                             glob.glob(os.path.join(SRC, ".github/workflows/*.yaml")))
+              wf_file = _pick_workflow(files) if files else None
+              if not wf_file:
+                  sys.exit("no .github/workflows/*.yml found in the repository")
+              log("workflow: " + os.path.relpath(wf_file, SRC))
+              wf = yaml.safe_load(open(wf_file, encoding="utf-8")) or {}
+              jobs = wf.get("jobs") or {}
+              for name in topo_order(jobs):
+                  job = jobs[name] or {}
+                  needs = job.get("needs") or []
+                  if needs:
+                      same = [d for d in needs if d in jobs]
+                      cross = [d for d in needs if d not in jobs]
+                      if same:
+                          log("job " + name + ": after same-leg jobs " + str(same))
+                      if cross:
+                          log("job " + name + ": cross-leg needs " + str(cross) + " treated as satisfied")
+                  matrix = (job.get("strategy") or {}).get("matrix")
+                  combos = expand_matrix(matrix) if matrix else [{}]
+                  if len(combos) > 1:
+                      log("job " + name + ": " + str(len(combos))
+                          + " matrix combos run sequentially on this leg")
+                  for combo in combos:
+                      flat = ctx_map(matrix=combo)
+                      seed_needs(flat)
+                      runs_on = str(job.get("runs-on", ""))
+                      if "$" in runs_on:
+                          runs_on = interpolate(runs_on, flat)
+                      slug = LABEL2SLUG.get(runs_on)
+                      if slug != SLUG:
+                          continue
+                      # GitHub gives every matrix combo a fresh runner; approximate
+                      # that with a pristine workspace, clean temp, restored env.
+                      env_snap = dict(os.environ)
+                      _reset_workspace()
+                      mdesc = " matrix=" + str(combo) if combo else ""
+                      log("== job " + name + " (runs-on " + runs_on + ")" + mdesc + " ==")
+                      cond = job.get("if")
+                      if cond is not None:
+                          try:
+                              if not eval_expression(_strip_expr_wrapper(cond), flat):
+                                  log("job " + name + ": skipped by if-condition")
+                                  continue
+                          except Exception:  # noqa: BLE001
+                              log("warning: cannot evaluate job if-condition, running: " + str(cond))
+          
+                      # Start service containers and job container
+                      combo_ran = combo_failed = False
+                      svc_env, svc_names = start_services(job.get("services"))
+                      job_cname = start_job_container(job.get("container"))
+                      try:
+                          job_env = {}
+                          for k, v in (job.get("env") or {}).items():
+                              job_env[k] = str(v)
+                          job_env.update(svc_env)
+                          flat = ctx_map(matrix=combo, env=job_env)
+                          for k in job_env:
+                              if "$" in job_env[k]:
+                                  try:
+                                      job_env[k] = interpolate(job_env[k], flat)
+                                      flat["env." + k] = job_env[k]
+                                  except ValueError:
+                                      pass
+                          for k, v in combo.items():
+                              key = re.sub(r"[^A-Za-z0-9_]", "_", k).upper()
+                              os.environ["MATRIX_" + key] = str(v)
+                          for i, step in enumerate(job.get("steps") or []):
+                              label = step.get("name") or step.get("uses") or "run"
+                              log("-- step " + str(i + 1) + ": " + str(label))
+                              if job_cname:
+                                  execute_step_in_container(step, flat, job_env, job_cname)
+                              else:
+                                  execute_step(step, flat, job_env, 0)
+                          # Resolve declared job outputs for needs.<job>.outputs.*.
+                          outs = {}
+                          out_flat = ctx_map(matrix=combo, env=job_env)
+                          for ok, ov in (job.get("outputs") or {}).items():
+                              try:
+                                  outs[ok] = interpolate(str(ov), out_flat)
+                              except Exception:  # noqa: BLE001
+                                  outs[ok] = ""
+                          for ok, ov in CURRENT_GOUTPUT.items():
+                              outs.setdefault(ok, str(ov))
+                          if outs:
+                              JOB_OUTPUTS[name] = outs
+                              log("job " + name + " outputs: " + str(outs))
+                          CURRENT_GOUTPUT.clear()
+                          combo_ran = True
+                      except SystemExit as e:
+                          # GitHub would fail the whole job here (fail-fast per combo);
+                          # the bridge keeps the remaining combos so whatever builds
+                          # still reaches the release. Job fails only if none succeed.
+                          combo_failed = True
+                          log("matrix combo FAILED (continuing with the rest): "
+                              + str(combo) + " exit=" + str(e.code))
+                          CURRENT_GOUTPUT.clear()
+                      finally:
+                          stop_services(svc_names)
+                          stop_job_container(job_cname)
+                          if len(combos) > 1:
+                              os.environ.clear()
+                              os.environ.update(env_snap)
+                      if combo_ran:
+                          JOB_COMBO_OK[name] = JOB_COMBO_OK.get(name, 0) + 1
+                      if combo_failed:
+                          JOB_COMBO_BAD[name] = JOB_COMBO_BAD.get(name, 0) + 1
+              for jname, bad in JOB_COMBO_BAD.items():
+                  ok = JOB_COMBO_OK.get(jname, 0)
+                  if ok == 0:
+                      log("job " + jname + ": all matrix combos failed")
+                      sys.exit("job " + jname + " failed on every matrix combo")
+                  log("warning: job " + jname + " partial: " + str(ok)
+                      + " combo(s) ok, " + str(bad) + " failed; publishing what built")
+              log("done")
+          
+          
+          def execute_step_in_container(step, flat, job_env, cname):
+              """Execute a run: step inside a Docker container via docker exec."""
+              if "uses" in step:
+                  execute_step(step, flat, job_env, 0)
+                  return
+              script = step.get("run")
+              if script is None:
+                  return
+              script = interpolate(script, flat)
+              shell = step.get("shell") or "bash"
+              if shell in ("bash", "sh"):
+                  cmd = ["docker", "exec", cname, "bash", "-e", "-c", script]
+              elif shell in ("pwsh", "powershell"):
+                  cmd = ["docker", "exec", cname, "pwsh", "-Command", script]
+              else:
+                  sys.exit("unsupported shell in container: " + str(shell))
+              r = subprocess.run(cmd, cwd=SRC)
+              if r.returncode != 0:
+                  sys.exit("container step failed with exit code " + str(r.returncode))
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except subprocess.TimeoutExpired:
+                  sys.exit("step timed out")
+          EXEC
+          chmod 700 "$RUNNER_TEMP/bridge/exec.py"
+
+      - name: Verify request
+        shell: bash
+        env:
+          BRIDGE_SIGNING_KEY: ${{ secrets.BRIDGE_SIGNING_KEY }}
+          CONTEXT_SHA: ${{ inputs.commit_sha }}
+          CONTEXT_REPO: ${{ inputs.repo_slug }}
+          CONTEXT_REF: ${{ inputs.ref || 'refs/heads/main' }}
+          SECRETS_WRAP: ${{ inputs.secrets_wrap }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          "$PY" "$RUNNER_TEMP/bridge/verify.py"
+
+      - name: Download encrypted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --silent --show-error \
+            --retry 3 --connect-timeout 20 --max-time 600 \
+            "$SOURCE_URL" -o bundle.tar
+          actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum bundle.tar | awk '{print $1}'; else shasum -a 256 bundle.tar | awk '{print $1}'; fi)
+          echo "downloaded $(wc -c < bundle.tar) bytes, sha256=$actual expected=$TRANSFER_SHA256"
+          if [[ "$actual" != "$TRANSFER_SHA256" ]]; then
+            head -c 64 bundle.tar | od -An -c | head -3
+            echo "transfer sha256 mismatch" >&2
+            exit 1
+          fi
+          mkdir -p bundle
+          tar -xf bundle.tar -C bundle
+
+      - name: Decrypt and verify source
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          # The static secret only unwraps the one-time source key generated
+          # for this build; the unwrapped key is destroyed right after use.
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+          chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+          age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o bridge/source.agekey bundle/key.age
+          age --decrypt -i bridge/source.agekey -o source.tar bundle/source.tar.age
+          shred -u "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey 2>/dev/null \
+            || rm -f "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey
+          actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum source.tar | awk '{print $1}'; else shasum -a 256 source.tar | awk '{print $1}'; fi)
+          if [[ "$actual" != "$SOURCE_SHA256" ]]; then
+            echo "source sha256 mismatch: $actual" >&2
+            exit 1
+          fi
+          mkdir -p build
+          # Windows (Git Bash) cannot create symlinks without extra privilege;
+          # materialize them as copies there. No-op on linux/macos.
+          export MSYS=winsymlinks:copy
+          tar -xf source.tar -C build
+          rm -f source.tar bundle.tar
+          rm -rf bundle
+
+      - name: Build source
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/output"
+          mkdir -p "$BRIDGE_OUTPUT_DIR"
+          cd "$RUNNER_TEMP/build/src"
+          case "$RECIPE" in
+            shell)
+              test -f .bridge/build.sh
+              bash ./.bridge/build.sh
+              ;;
+            actions)
+              PY=$(command -v python3 || command -v python)
+              if [[ -n "$SECRETS_WRAP" && -n "${BRIDGE_SOURCE_AGE_KEY:-}" ]]; then
+                printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+                chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+                printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age"
+                age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" \
+                  -o "$RUNNER_TEMP/bridge/secrets.txt" "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null \
+                  || { echo "cannot decrypt secrets" >&2; exit 1; }
+                chmod 600 "$RUNNER_TEMP/bridge/secrets.txt"
+                rm -f "$RUNNER_TEMP/bridge/secrets.age" "$RUNNER_TEMP/bridge/unwrap.agekey"
+              fi
+              if ! "$PY" -c "import yaml" 2>/dev/null; then
+                "$PY" -m pip install --quiet --break-system-packages pyyaml \
+                  || "$PY" -m pip install --quiet pyyaml \
+                  || "$PY" -m pip install --quiet --user pyyaml
+              fi
+              "$PY" -c "import yaml" || { echo "pyyaml unavailable on this leg" >&2; exit 1; }
+              export BRIDGE_SRC="$PWD"
+              if [[ -f "$RUNNER_TEMP/bridge/secrets.txt" ]]; then
+                export BRIDGE_SECRETS="$(cat "$RUNNER_TEMP/bridge/secrets.txt")"
+                shred -u "$RUNNER_TEMP/bridge/secrets.txt" 2>/dev/null || rm -f "$RUNNER_TEMP/bridge/secrets.txt"
+              fi
+              "$PY" "$RUNNER_TEMP/bridge/exec.py"
+              ;;
+            *)
+              echo "Unsupported recipe: $RECIPE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Encrypt intermediate output
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP" && tar -C output -czf output.tar.gz .)
+          age -r "$OUTPUT_AGE_RECIPIENT" \
+            -o "$RUNNER_TEMP/output-${SLUG}.tar.gz.age" \
+            "$RUNNER_TEMP/output.tar.gz"
+          rm -rf "$RUNNER_TEMP/output" "$RUNNER_TEMP/output.tar.gz"
+
+      - name: Upload encrypted intermediate
+        uses: actions/upload-artifact@v7
+        with:
+          name: encrypted-output-${{ matrix.slug }}
+          path: ${{ runner.temp }}/output-${{ matrix.slug }}.tar.gz.age
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [select, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA256: ${{ inputs.source_sha256 }}
+      PUBLIC_VERSION: ${{ inputs.public_version }}
+      RECIPE: ${{ inputs.recipe }}
+      OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
+      OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
+      SELECTED_SLUGS: ${{ needs.select.outputs.slugs }}
+
+    steps:
+      - name: Download per-leg encrypted intermediates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for slug in $SELECTED_SLUGS; do
+            aid=""
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              aid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+                --jq ".artifacts[] | select(.name == \"encrypted-output-$slug\") | .id")
+              [[ -n "$aid" ]] && break
+              echo "artifact for $slug not visible yet (attempt $attempt), waiting" >&2
+              sleep 6
+            done
+            [[ -n "$aid" ]] || { echo "artifact missing for $slug" >&2; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$aid/zip" > "leg-$slug.zip"
+            mkdir "leg-$slug"
+            unzip -oq "leg-$slug.zip" -d "leg-$slug"
+            mv "leg-$slug/output-$slug.tar.gz.age" "output-$slug.tar.gz.age"
+            rm -rf "leg-$slug" "leg-$slug.zip"
+          done
+
+      - name: Package password-encrypted release
+        env:
+          BRIDGE_OUTPUT_AGE_KEY: ${{ secrets.BRIDGE_OUTPUT_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age p7zip-full
+          # Unwrap the one-time output keypair and passphrase for this build.
+          wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
+          eph="$RUNNER_TEMP/bridge/output.agekey"
+          mkdir -p "$RUNNER_TEMP/bridge"
+          printf '%s\n' "$BRIDGE_OUTPUT_AGE_KEY" > "$wrap"
+          chmod 600 "$wrap"
+          printf '%s' "$OUTPUT_KEY_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/output-key.age"
+          printf '%s' "$OUTPUT_PASS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/pass.age"
+          age --decrypt -i "$wrap" -o "$eph" "$RUNNER_TEMP/bridge/output-key.age"
+          OUTPUT_PASSPHRASE=$(age --decrypt -i "$wrap" "$RUNNER_TEMP/bridge/pass.age")
+          shred -u "$wrap" "$RUNNER_TEMP/bridge/pass.age"
+          echo "::add-mask::$OUTPUT_PASSPHRASE"
+          mkdir output
+          for slug in $SELECTED_SLUGS; do
+            age --decrypt -i "$eph" -o "output-$slug.tar.gz" "output-$slug.tar.gz.age"
+            mkdir "output/$slug"
+            tar -xzf "output-$slug.tar.gz" -C "output/$slug"
+            rm -f "output-$slug.tar.gz" "output-$slug.tar.gz.age"
+          done
+          shred -u "$eph"
+          rm -f "$RUNNER_TEMP/bridge/output-key.age"
+          (
+            cd output
+            find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS
+            printf 'source_sha256=%s\npublic_version=%s\nrecipe=%s\n' \
+              "$SOURCE_SHA256" "$PUBLIC_VERSION" "$RECIPE" > BRIDGE-MANIFEST.txt
+          )
+          asset="artifact-$PUBLIC_VERSION.7z"
+          (
+            cd output
+            7z a -bd -bso0 -bsp0 -t7z -mx=9 -mhe=on \
+              -p"${OUTPUT_PASSPHRASE:?}" "../$asset" .
+          )
+          sha256sum "$asset" > "$asset.sha256"
+          rm -rf output
+
+      - name: Publish keyed public version
+        run: |
+          set -euo pipefail
+          tag="build-$PUBLIC_VERSION"
+          asset="artifact-$PUBLIC_VERSION.7z"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" "$asset.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$asset" "$asset.sha256" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Build $PUBLIC_VERSION" \
+              --notes "Encrypted artifact for keyed public version $PUBLIC_VERSION."
+          fi
