@@ -233,6 +233,9 @@ jobs:
           CURRENT_GOUTPUT = {}
           # Pristine snapshot of the source workspace (fresh-runner semantics)
           PRISTINE = None
+          # RUNNER_TEMP listing captured before the first combo: pre-installed tools
+          # (e.g. age on windows) live here and must survive combo resets
+          TEMP_SNAPSHOT = None
           # Temp entries that belong to the bridge itself and must survive resets
           TEMP_KEEP = ("bridge", "output")
           # Actions whose only purpose is publishing to GitHub; the bridge publishes
@@ -963,10 +966,15 @@ jobs:
                       shutil.copy2(s, d, follow_symlinks=False)
               rt = os.environ.get("RUNNER_TEMP")
               if rt and os.path.isdir(rt):
+                  global TEMP_SNAPSHOT
+                  if TEMP_SNAPSHOT is None:
+                      TEMP_SNAPSHOT = set(os.listdir(rt))
                   src_abs = os.path.abspath(SRC)
                   keep_abs = [src_abs, os.path.abspath(PRISTINE)]
                   for entry in os.listdir(rt):
-                      if entry in TEMP_KEEP or entry.startswith("output-"):
+                      # never touch pre-existing tool installs or bridge outputs
+                      if (entry in TEMP_SNAPSHOT or entry in TEMP_KEEP
+                              or entry.startswith("output-")):
                           continue
                       p = os.path.abspath(os.path.join(rt, entry))
                       # never delete the workspace or the pristine snapshot itself
