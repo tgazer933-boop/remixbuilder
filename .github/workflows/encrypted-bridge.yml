@@ -62,7 +62,7 @@ jobs:
           m = {
               "linux-amd64": "ubuntu-latest",
               "linux-arm64": "ubuntu-24.04-arm",
-              "macos-amd64": "macos-13",
+              "macos-amd64": "macos-15-intel",
               "macos-arm64": "macos-latest",
               "windows-amd64": "windows-latest",
           }
@@ -808,6 +808,9 @@ jobs:
             exit 1
           fi
           mkdir -p build
+          # Windows (Git Bash) cannot create symlinks without extra privilege;
+          # materialize them as copies there. No-op on linux/macos.
+          export MSYS=winsymlinks:copy
           tar -xf source.tar -C build
           rm -f source.tar bundle.tar
           rm -rf bundle
