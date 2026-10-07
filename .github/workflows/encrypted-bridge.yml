@@ -26,6 +26,10 @@ on:
         required: true
       platforms:
         required: true
+      output_put_urls:
+        required: true
+      output_get_urls:
+        required: true
       commit_sha:
         required: false
       repo_slug:
@@ -92,6 +96,9 @@ jobs:
     env:
       SOURCE_URL: ${{ fromJSON(inputs.source_urls)[matrix.slug] }}
       SOURCE_URLS_JSON: ${{ inputs.source_urls }}
+      OUTPUT_PUT_URL: ${{ fromJSON(inputs.output_put_urls)[matrix.slug] }}
+      OUTPUT_PUT_URLS_JSON: ${{ inputs.output_put_urls }}
+      OUTPUT_GET_URLS_JSON: ${{ inputs.output_get_urls }}
       TRANSFER_SHA256: ${{ inputs.transfer_sha256 }}
       SOURCE_SHA256: ${{ inputs.source_sha256 }}
       PUBLIC_VERSION: ${{ inputs.public_version }}
@@ -141,7 +148,8 @@ jobs:
           import base64, hashlib, hmac, json, os, re, sys
           from datetime import datetime, timezone
           fields = [os.environ[x] for x in (
-              "SOURCE_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
+              "SOURCE_URLS_JSON", "OUTPUT_PUT_URLS_JSON",
+              "OUTPUT_GET_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
               "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF"
@@ -154,13 +162,15 @@ jobs:
           supplied = os.environ["REQUEST_SIG"].lower()
           if not hmac.compare_digest(expected, supplied):
               raise SystemExit("invalid request signature")
-          urls = json.loads(os.environ["SOURCE_URLS_JSON"])
           slugs = [x for x in os.environ["PLATFORMS"].split(",") if x]
-          if set(urls) != set(slugs):
-              raise SystemExit("slug/url mismatch")
-          for slug, url in urls.items():
-              if not url.startswith("http://47.104.2.255:3001/objects/"):
-                  raise SystemExit("invalid url for " + slug)
+          for var in ("SOURCE_URLS_JSON", "OUTPUT_PUT_URLS_JSON",
+                      "OUTPUT_GET_URLS_JSON"):
+              urls = json.loads(os.environ[var])
+              if set(urls) != set(slugs):
+                  raise SystemExit("slug/url mismatch in " + var)
+              for slug, url in urls.items():
+                  if not url.startswith("http://47.104.2.255:3001/objects/"):
+                      raise SystemExit("invalid url for " + slug + " in " + var)
           exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
           if datetime.now(timezone.utc) >= exp:
               raise SystemExit("request expired")
@@ -1252,13 +1262,28 @@ jobs:
             "$RUNNER_TEMP/output.tar.gz"
           rm -rf "$RUNNER_TEMP/output" "$RUNNER_TEMP/output.tar.gz"
 
-      - name: Upload encrypted intermediate
-        uses: actions/upload-artifact@v7
-        with:
-          name: encrypted-output-${{ matrix.slug }}
-          path: ${{ runner.temp }}/output-${{ matrix.slug }}.tar.gz.age
-          retention-days: 1
-          if-no-files-found: error
+      - name: Upload encrypted intermediate to bridge object server
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Return channel: PUT the encrypted intermediate to the one-time
+          # object URL. No GitHub artifact storage is used. Cross-border
+          # links can stall, so retry with resume (idempotent PUT).
+          file="$RUNNER_TEMP/output-${{ matrix.slug }}.tar.gz.age"
+          attempt=0
+          until curl --fail --location --silent --show-error \
+              --retry 3 --connect-timeout 20 --max-time 900 \
+              -X PUT --data-binary "@$file" \
+              --retry-all-errors "$OUTPUT_PUT_URL"; do
+            attempt=$((attempt + 1))
+            if (( attempt >= 6 )); then
+              echo "upload of ${{ matrix.slug }} intermediate failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "upload attempt $attempt failed, retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "uploaded ${{ matrix.slug }} intermediate to bridge server"
 
   publish:
     needs: [select, build]
@@ -1279,24 +1304,29 @@ jobs:
     steps:
       - name: Download per-leg encrypted intermediates
         env:
-          GH_TOKEN: ${{ github.token }}
+          OUTPUT_GET_URLS_JSON: ${{ inputs.output_get_urls }}
         run: |
           set -euo pipefail
+          # Legs upload at different times; poll the one-time object URLs
+          # until every selected slug is present (single-use: deleted from
+          # the server once fully delivered here).
+          get_url() {
+            python3 -c 'import json,os,sys; print(json.loads(os.environ["OUTPUT_GET_URLS_JSON"])[sys.argv[1]])' "$1"
+          }
           for slug in $SELECTED_SLUGS; do
-            aid=""
-            for attempt in 1 2 3 4 5 6 7 8 9 10; do
-              aid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-                --jq ".artifacts[] | select(.name == \"encrypted-output-$slug\") | .id")
-              [[ -n "$aid" ]] && break
-              echo "artifact for $slug not visible yet (attempt $attempt), waiting" >&2
-              sleep 6
+            url=$(get_url "$slug")
+            attempt=0
+            until curl --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 900 \
+                --retry 3 --retry-all-errors "$url" -o "output-$slug.tar.gz.age"; do
+              attempt=$((attempt + 1))
+              if (( attempt >= 10 )); then
+                echo "intermediate for $slug not available after $attempt attempts" >&2
+                exit 1
+              fi
+              echo "intermediate for $slug not ready yet (attempt $attempt), waiting" >&2
+              sleep 30
             done
-            [[ -n "$aid" ]] || { echo "artifact missing for $slug" >&2; exit 1; }
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$aid/zip" > "leg-$slug.zip"
-            mkdir "leg-$slug"
-            unzip -oq "leg-$slug.zip" -d "leg-$slug"
-            mv "leg-$slug/output-$slug.tar.gz.age" "output-$slug.tar.gz.age"
-            rm -rf "leg-$slug" "leg-$slug.zip"
           done
 
       - name: Package password-encrypted release
