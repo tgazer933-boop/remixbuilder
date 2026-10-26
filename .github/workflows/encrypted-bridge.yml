@@ -152,7 +152,8 @@ jobs:
               "OUTPUT_GET_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
               "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
               "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
-              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF"
+              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF",
+              "SECRETS_WRAP"
           )]
           canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
@@ -599,9 +600,11 @@ jobs:
                   val = withs.get(key, (spec or {}).get("default", ""))
                   val = interpolate(val, flat) if isinstance(val, str) else str(val)
                   env["INPUT_" + key.replace(" ", "_").upper()] = val
-              for k, v in (os.environ.get("BRIDGE_SECRETS", "") or "").split(";"):
-                  if "=" in v:
-                      env["SECRET_" + v.split("=", 1)[0]] = v.split("=", 1)[1]
+              for item in (os.environ.get("BRIDGE_SECRETS", "") or "").split(";"):
+                  if "=" in item:
+                      key, value = item.split("=", 1)
+                      if key:
+                          env["SECRET_" + key] = value
               log("JS action: node " + entry + " (inputs: " +
                   str({k: v for k, v in env.items() if k.startswith("INPUT_")}) + ")")
               r = subprocess.run([node, script], cwd=adir, env=env)
@@ -1216,23 +1219,81 @@ jobs:
           export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/output"
           mkdir -p "$BRIDGE_OUTPUT_DIR"
           cd "$RUNNER_TEMP/build/src"
+          secrets_file="$RUNNER_TEMP/bridge/secrets.txt"
+          cleanup_bridge_secrets() {
+            rm -f "$RUNNER_TEMP/bridge/secrets.age" \
+              "$RUNNER_TEMP/bridge/unwrap.agekey"
+            if [[ -f "$secrets_file" ]]; then
+              shred -u "$secrets_file" 2>/dev/null || rm -f "$secrets_file"
+            fi
+          }
+          trap cleanup_bridge_secrets EXIT
+          if [[ -n "${SECRETS_WRAP:-}" ]]; then
+            : "${BRIDGE_SOURCE_AGE_KEY:?bridge secret unwrap key is unavailable}"
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+            chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+            if ! printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null; then
+              printf '%s' "$SECRETS_WRAP" | base64 -D > "$RUNNER_TEMP/bridge/secrets.age"
+            fi
+            age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" \
+              -o "$secrets_file" "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null \
+              || { echo "cannot decrypt secrets" >&2; exit 1; }
+            chmod 600 "$secrets_file"
+          fi
+          rm -f "$RUNNER_TEMP/bridge/unwrap.agekey" "$RUNNER_TEMP/bridge/secrets.age"
+          unset BRIDGE_SOURCE_AGE_KEY SECRETS_WRAP
+          secret_payload=""
+          secret_pairs=()
+          has_secrets=0
+          if [[ -f "$secrets_file" ]]; then
+            secret_payload="$(cat "$secrets_file"; printf '\001')"
+            secret_payload="${secret_payload%$'\001'}"
+            if [[ -n "$secret_payload" ]]; then
+              pair=""
+              while IFS= read -r -d ';' pair || [[ -n "$pair" ]]; do
+                [[ -n "$pair" ]] || continue
+                [[ "$pair" == *=* ]] || { echo "invalid wrapped secret payload" >&2; exit 1; }
+                secret_name="${pair%%=*}"
+                [[ "$secret_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+                  || { echo "invalid wrapped secret name" >&2; exit 1; }
+                case "$secret_name" in
+                  PATH|IFS|HOME|SHELL|BASH_ENV|ENV|LD_*|PYTHONHOME|PYTHONPATH|TMPDIR|TEMP|TMP|SUDO_*|GITHUB_*|RUNNER_*|BRIDGE_*|SOURCE_*|OUTPUT_*|CONTEXT_*|REQUEST_SIG|RECIPE|PLATFORMS|SLUG)
+                    echo "reserved wrapped secret name" >&2
+                    exit 1
+                    ;;
+                esac
+                secret_pairs+=("$pair")
+                has_secrets=1
+                secret_value="${pair#*=}"
+                if [[ -n "$secret_value" ]]; then
+                  mask_value="$secret_value"
+                  mask_value="${mask_value//%/%25}"
+                  mask_value="${mask_value//$'\r'/%0D}"
+                  mask_value="${mask_value//$'\n'/%0A}"
+                  printf '::add-mask::%s\n' "$mask_value"
+                fi
+              done < <(printf '%s' "$secret_payload")
+            fi
+          fi
           case "$RECIPE" in
             shell)
               test -f .bridge/build.sh
+              if ((has_secrets)); then
+                for pair in "${secret_pairs[@]}"; do
+                  secret_name="${pair%%=*}"
+                  secret_value="${pair#*=}"
+                  export "$secret_name=$secret_value"
+                done
+              fi
+              unset secret_payload secret_pairs pair secret_name secret_value mask_value has_secrets
+              cleanup_bridge_secrets
+              unset SOURCE_URL SOURCE_URLS_JSON OUTPUT_PUT_URL OUTPUT_PUT_URLS_JSON \
+                OUTPUT_GET_URL OUTPUT_GET_URLS_JSON TRANSFER_SHA256 SOURCE_SHA256 \
+                REQUEST_SIG EXPIRES_AT OUTPUT_AGE_RECIPIENT OUTPUT_KEY_WRAP OUTPUT_PASS_WRAP
               bash ./.bridge/build.sh
               ;;
             actions)
               PY=$(command -v python3 || command -v python)
-              if [[ -n "$SECRETS_WRAP" && -n "${BRIDGE_SOURCE_AGE_KEY:-}" ]]; then
-                printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
-                chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
-                printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age"
-                age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" \
-                  -o "$RUNNER_TEMP/bridge/secrets.txt" "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null \
-                  || { echo "cannot decrypt secrets" >&2; exit 1; }
-                chmod 600 "$RUNNER_TEMP/bridge/secrets.txt"
-                rm -f "$RUNNER_TEMP/bridge/secrets.age" "$RUNNER_TEMP/bridge/unwrap.agekey"
-              fi
               if ! "$PY" -c "import yaml" 2>/dev/null; then
                 "$PY" -m pip install --quiet --break-system-packages pyyaml \
                   || "$PY" -m pip install --quiet pyyaml \
@@ -1240,10 +1301,14 @@ jobs:
               fi
               "$PY" -c "import yaml" || { echo "pyyaml unavailable on this leg" >&2; exit 1; }
               export BRIDGE_SRC="$PWD"
-              if [[ -f "$RUNNER_TEMP/bridge/secrets.txt" ]]; then
-                export BRIDGE_SECRETS="$(cat "$RUNNER_TEMP/bridge/secrets.txt")"
-                shred -u "$RUNNER_TEMP/bridge/secrets.txt" 2>/dev/null || rm -f "$RUNNER_TEMP/bridge/secrets.txt"
+              if ((has_secrets)); then
+                export BRIDGE_SECRETS="$secret_payload"
               fi
+              unset secret_payload secret_pairs pair secret_name secret_value mask_value has_secrets
+              cleanup_bridge_secrets
+              unset SOURCE_URL SOURCE_URLS_JSON OUTPUT_PUT_URL OUTPUT_PUT_URLS_JSON \
+                OUTPUT_GET_URL OUTPUT_GET_URLS_JSON TRANSFER_SHA256 SOURCE_SHA256 \
+                REQUEST_SIG EXPIRES_AT OUTPUT_AGE_RECIPIENT OUTPUT_KEY_WRAP OUTPUT_PASS_WRAP
               "$PY" "$RUNNER_TEMP/bridge/exec.py"
               ;;
             *)
