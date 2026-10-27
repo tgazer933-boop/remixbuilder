@@ -1432,10 +1432,12 @@ jobs:
           asset="artifact-$PUBLIC_VERSION.7z"
           (
             cd output
-            7z a -bd -bso0 -bsp0 -t7z -mx=9 -mhe=on \
+            7z a -bd -bso0 -bsp0 -t7z -mx=9 -mhe=on -v1400m \
               -p"${OUTPUT_PASSPHRASE:?}" "../$asset" .
           )
-          sha256sum "$asset" > "$asset.sha256"
+          ls -l "$asset".0* >&2
+          sha256sum "$asset".0* > "$asset.sha256"
+          cat "$asset.sha256" >&2
           rm -rf output
 
       - name: Publish keyed public version
@@ -1443,12 +1445,20 @@ jobs:
           set -euo pipefail
           tag="build-$PUBLIC_VERSION"
           asset="artifact-$PUBLIC_VERSION.7z"
+          shopt -s nullglob
+          parts=("$asset".0*)
+          shopt -u nullglob
+          if (( ${#parts[@]} == 0 )); then
+            echo "no volume files produced for $asset" >&2
+            exit 1
+          fi
+          echo "publishing ${#parts[@]} volume(s) for $PUBLIC_VERSION"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "$asset" "$asset.sha256" \
+            gh release upload "$tag" "${parts[@]}" "$asset.sha256" \
               --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$tag" "$asset" "$asset.sha256" \
+            gh release create "$tag" "${parts[@]}" "$asset.sha256" \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Build $PUBLIC_VERSION" \
-              --notes "Encrypted artifact for keyed public version $PUBLIC_VERSION."
+              --notes "Encrypted artifact (split volumes) for keyed public version $PUBLIC_VERSION."
           fi
