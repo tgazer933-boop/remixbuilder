@@ -1333,12 +1333,12 @@ jobs:
           set -euo pipefail
           # Return channel: PUT the encrypted intermediate to the one-time
           # object URL. No GitHub artifact storage is used. Cross-border
-          # links can stall, so retry with resume (idempotent PUT).
+          # links can stall, so retry the idempotent PUT from the file.
           file="$RUNNER_TEMP/output-${{ matrix.slug }}.tar.gz.age"
           attempt=0
           until curl --fail --location --silent --show-error \
               --retry 3 --connect-timeout 20 --max-time 900 \
-              -X PUT --data-binary "@$file" \
+              --upload-file "$file" \
               --retry-all-errors "$OUTPUT_PUT_URL"; do
             attempt=$((attempt + 1))
             if (( attempt >= 6 )); then
