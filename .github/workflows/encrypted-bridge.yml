@@ -1353,7 +1353,11 @@ jobs:
   publish:
     needs: [select, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The intermediate is 2.2 GB and comes back through a single object-server GET, so this job's wall clock is set by
+    # the link, not by the work: the successful build of 2026-11-20 15:16 downloaded it in 0.4 s on a fast runner and
+    # finished in 6m51s, while the one at 20:56 ran at 1.8 MB/s, hit the 900 s --max-time of that step with 1.6 GB of
+    # 2.2 GB, spent 4 more minutes retrying, and was canceled by a 20-minute job limit 86 s into the packaging step.
+    timeout-minutes: 60
     permissions:
       contents: write
       actions: read
@@ -1375,6 +1379,12 @@ jobs:
           # Legs upload at different times; poll the one-time object URLs
           # until every selected slug is present (single-use: deleted from
           # the server once fully delivered here).
+          #
+          # --max-time has to fit the link, not the usual case: 2.2 GB at the
+          # 1.8 MB/s of 2026-11-20 20:56 is 21 minutes, and the 900 s that was
+          # here cut the transfer at 1.6 GB. A partial download is not a
+          # delivered object, so the retry starts the file over: the budget
+          # below leaves room for two full attempts inside the job's 60 min.
           get_url() {
             python3 -c 'import json,os,sys; print(json.loads(os.environ["OUTPUT_GET_URLS_JSON"])[sys.argv[1]])' "$1"
           }
@@ -1382,7 +1392,7 @@ jobs:
             url=$(get_url "$slug")
             attempt=0
             until curl --fail --location --silent --show-error \
-                --connect-timeout 20 --max-time 900 \
+                --connect-timeout 20 --max-time 1800 \
                 --retry 3 --retry-all-errors "$url" -o "output-$slug.tar.gz.age"; do
               attempt=$((attempt + 1))
               if (( attempt >= 10 )); then
