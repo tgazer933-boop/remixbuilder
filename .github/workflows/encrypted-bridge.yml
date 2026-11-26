@@ -38,6 +38,12 @@ on:
         required: false
       secrets_wrap:
         required: false
+      shards:
+        required: false
+        default: ''
+      shard_source_urls:
+        required: false
+        default: '{}'
 
 permissions: {}
 
@@ -53,16 +59,19 @@ jobs:
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
       slugs: ${{ steps.mk.outputs.slugs }}
+      has_shards: ${{ steps.mk.outputs.has_shards }}
+      shard_matrix: ${{ steps.mk.outputs.shard_matrix }}
     steps:
       - name: Select platform matrix
         id: mk
         shell: bash
         env:
           PLATFORMS: ${{ inputs.platforms }}
+          SHARDS: ${{ inputs.shards }}
         run: |
           set -euo pipefail
           SELECT=$(python3 <<'PYSEL'
-          import json, os
+          import json, os, re
           m = {
               "linux-amd64": "ubuntu-latest",
               "linux-arm64": "ubuntu-24.04-arm",
@@ -75,18 +84,356 @@ jobs:
           items = [x for x in os.environ["PLATFORMS"].split(",") if x]
           if not items or any(x not in m for x in items):
               raise SystemExit("invalid platforms: " + os.environ["PLATFORMS"])
+          shards = [x for x in os.environ.get("SHARDS", "").split(",") if x]
+          for sh in shards:
+              if sh == "final" or not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", sh):
+                  raise SystemExit("invalid shard: " + sh)
           print(json.dumps({"include": [{"slug": x, "image": m[x]} for x in items]}))
           print(" ".join(items))
+          print("true" if shards else "false")
+          print(json.dumps({"include": [{"slug": x, "image": m[x], "shard": sh} for x in items for sh in shards]}))
           PYSEL
           )
           MATRIX=$(sed -n 1p <<<"$SELECT")
           SLUGS=$(sed -n 2p <<<"$SELECT")
+          HAS_SHARDS=$(sed -n 3p <<<"$SELECT")
+          SHARD_MATRIX=$(sed -n 4p <<<"$SELECT")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "slugs=$SLUGS" >> "$GITHUB_OUTPUT"
-          echo "selected: $MATRIX ($SLUGS)"
+          echo "has_shards=$HAS_SHARDS" >> "$GITHUB_OUTPUT"
+          echo "shard_matrix=$SHARD_MATRIX" >> "$GITHUB_OUTPUT"
+          echo "selected: $MATRIX ($SLUGS) shards=$HAS_SHARDS"
+
+  build_shard:
+    needs: select
+    if: ${{ needs.select.outputs.has_shards == 'true' }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.select.outputs.shard_matrix) }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 180
+    permissions: {}
+    env:
+      SOURCE_URL: ${{ fromJSON(inputs.shard_source_urls)[format('{0}:{1}', matrix.slug, matrix.shard)] }}
+      SOURCE_URLS_JSON: ${{ inputs.source_urls }}
+      SHARD_SOURCE_URLS_JSON: ${{ inputs.shard_source_urls }}
+      SHARDS: ${{ inputs.shards }}
+      SHARD: ${{ matrix.shard }}
+      OUTPUT_PUT_URLS_JSON: ${{ inputs.output_put_urls }}
+      OUTPUT_GET_URLS_JSON: ${{ inputs.output_get_urls }}
+      TRANSFER_SHA256: ${{ inputs.transfer_sha256 }}
+      SOURCE_SHA256: ${{ inputs.source_sha256 }}
+      PUBLIC_VERSION: ${{ inputs.public_version }}
+      RECIPE: ${{ inputs.recipe }}
+      EXPIRES_AT: ${{ inputs.expires_at }}
+      REQUEST_SIG: ${{ inputs.request_sig }}
+      OUTPUT_AGE_RECIPIENT: ${{ inputs.output_age_recipient }}
+      OUTPUT_KEY_WRAP: ${{ inputs.output_key_wrap }}
+      OUTPUT_PASS_WRAP: ${{ inputs.output_pass_wrap }}
+      PLATFORMS: ${{ inputs.platforms }}
+      SLUG: ${{ matrix.slug }}
+      CONTEXT_SHA: ${{ inputs.commit_sha }}
+      CONTEXT_REPO: ${{ inputs.repo_slug }}
+      CONTEXT_REF: ${{ inputs.ref || 'refs/heads/main' }}
+      SECRETS_WRAP: ${{ inputs.secrets_wrap }}
+
+    steps:
+      - name: Install bridge tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS:?}" in
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq age pigz zstd
+              ;;
+            macOS)
+              brew install age zstd
+              ;;
+            Windows)
+              curl -fsSL --retry 3 -o "$RUNNER_TEMP/age.zip" \
+                "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip"
+              (cd "$RUNNER_TEMP" && /c/Windows/System32/tar.exe -xf age.zip)
+              echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+              export PATH="$RUNNER_TEMP/age:$PATH"
+              ;;
+          esac
+          age --version
+
+      - name: Verify request
+        shell: bash
+        env:
+          BRIDGE_SIGNING_KEY: ${{ secrets.BRIDGE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          "$PY" - <<'PY'
+          import base64, hashlib, hmac, json, os, re
+          from datetime import datetime, timezone
+          fields = [os.environ[x] for x in (
+              "SOURCE_URLS_JSON", "OUTPUT_PUT_URLS_JSON",
+              "OUTPUT_GET_URLS_JSON", "TRANSFER_SHA256", "SOURCE_SHA256",
+              "PUBLIC_VERSION", "RECIPE", "EXPIRES_AT",
+              "OUTPUT_AGE_RECIPIENT", "OUTPUT_KEY_WRAP", "OUTPUT_PASS_WRAP",
+              "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF",
+              "SECRETS_WRAP", "SHARDS", "SHARD_SOURCE_URLS_JSON"
+          )]
+          canonical = "v2\n" + "\n".join(fields)
+          expected = hmac.new(
+              os.environ["BRIDGE_SIGNING_KEY"].encode(),
+              canonical.encode(), hashlib.sha256
+          ).hexdigest()
+          if not hmac.compare_digest(expected, os.environ["REQUEST_SIG"].lower()):
+              raise SystemExit("invalid request signature")
+          slugs = [x for x in os.environ["PLATFORMS"].split(",") if x]
+          shards = [x for x in os.environ["SHARDS"].split(",") if x]
+          shard_urls = json.loads(os.environ["SHARD_SOURCE_URLS_JSON"])
+          want_keys = {f"{s}:{sh}" for s in slugs for sh in shards}
+          if set(shard_urls) != want_keys:
+              raise SystemExit("shard url mismatch")
+          for k, url in shard_urls.items():
+              if not url.startswith("http://47.104.2.255:3001/objects/"):
+                  raise SystemExit("invalid shard url for " + k)
+          exp = datetime.fromisoformat(os.environ["EXPIRES_AT"].replace("Z", "+00:00"))
+          if datetime.now(timezone.utc) >= exp:
+              raise SystemExit("request expired")
+          PY
+
+      - name: Compute encrypted cache scope
+        id: cache_scope
+        shell: bash
+        env:
+          BRIDGE_SIGNING_KEY: ${{ secrets.BRIDGE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          SCOPE=$("$PY" - <<'PYSC'
+          import hashlib, hmac, os
+          msg = ("cache-v1\n" + os.environ["CONTEXT_REPO"] + "\n" + os.environ["SLUG"] + "\n" + os.environ["SHARD"]).encode()
+          print(hmac.new(os.environ["BRIDGE_SIGNING_KEY"].encode(), msg, hashlib.sha256).hexdigest()[:24])
+          PYSC
+          )
+          echo "prefix=bridge-cache-v1-${SCOPE}-" >> "$GITHUB_OUTPUT"
+          echo "key=bridge-cache-v1-${SCOPE}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted cache blob
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bridge-cache-blob
+          key: ${{ steps.cache_scope.outputs.key }}
+          restore-keys: |
+            ${{ steps.cache_scope.outputs.prefix }}
+
+      - name: Unpack encrypted bridge cache
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bridge" "$RUNNER_TEMP/bridge-cache"
+          if [[ -s "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" ]]; then
+            key="$RUNNER_TEMP/bridge/cache-unwrap.agekey"
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+            chmod 600 "$key"
+            fmt=$(cat "$RUNNER_TEMP/bridge-cache-blob/cache.meta" 2>/dev/null || echo raw)
+            if [[ "$fmt" == zstd ]] && command -v zstd >/dev/null 2>&1; then
+              age --decrypt -i "$key" "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" | zstd -dc | tar -xf - -C "$RUNNER_TEMP/bridge-cache" || true
+            else
+              age --decrypt -i "$key" "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" | tar -xf - -C "$RUNNER_TEMP/bridge-cache" || true
+            fi
+            shred -u "$key" 2>/dev/null || rm -f "$key"
+            echo "restored encrypted bridge cache for shard $SHARD"
+          fi
+          rm -rf "$RUNNER_TEMP/bridge-cache-blob"
+          PY=$(command -v python3 || command -v python)
+          "$PY" - "$RUNNER_TEMP/bridge-cache" > "$RUNNER_TEMP/bridge/cache.before.sha" <<'PYFP'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          for d, ds, fs in os.walk(root):
+              ds.sort(); fs.sort()
+              for f in fs:
+                  p = os.path.join(d, f)
+                  st = os.lstat(p)
+                  h.update(f"{os.path.relpath(p, root)}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+          print(h.hexdigest())
+          PYFP
+
+      - name: Download encrypted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --silent --show-error \
+            --retry 3 --connect-timeout 20 --max-time 600 \
+            "$SOURCE_URL" -o bundle.tar
+          actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum bundle.tar | awk '{print $1}'; else shasum -a 256 bundle.tar | awk '{print $1}'; fi)
+          [[ "$actual" == "$TRANSFER_SHA256" ]] || { echo "transfer sha256 mismatch" >&2; exit 1; }
+          mkdir -p bundle
+          tar -xf bundle.tar -C bundle
+
+      - name: Decrypt and verify source
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+          chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+          age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o bridge/source.agekey bundle/key.age
+          age --decrypt -i bridge/source.agekey -o source.tar bundle/source.tar.age
+          shred -u "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey 2>/dev/null \
+            || rm -f "$RUNNER_TEMP/bridge/unwrap.agekey" bridge/source.agekey
+          actual=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum source.tar | awk '{print $1}'; else shasum -a 256 source.tar | awk '{print $1}'; fi)
+          [[ "$actual" == "$SOURCE_SHA256" ]] || { echo "source sha256 mismatch: $actual" >&2; exit 1; }
+          mkdir -p build
+          export MSYS=winsymlinks:copy
+          tar -xf source.tar -C build
+          rm -f source.tar bundle.tar
+          rm -rf bundle
+
+      - name: Build shard
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          export BRIDGE_SHARD="$SHARD"
+          export BRIDGE_SHARD_OUT="$RUNNER_TEMP/shard-out"
+          export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/shard-out"
+          export BRIDGE_CACHE_DIR="$RUNNER_TEMP/bridge-cache"
+          mkdir -p "$BRIDGE_SHARD_OUT" "$BRIDGE_CACHE_DIR"
+          cd "$RUNNER_TEMP/build/src"
+          secrets_file="$RUNNER_TEMP/bridge/secrets.txt"
+          cleanup_bridge_secrets() {
+            rm -f "$RUNNER_TEMP/bridge/secrets.age" "$RUNNER_TEMP/bridge/unwrap.agekey"
+            [[ -f "$secrets_file" ]] && { shred -u "$secrets_file" 2>/dev/null || rm -f "$secrets_file"; } || true
+          }
+          trap cleanup_bridge_secrets EXIT
+          if [[ -n "${SECRETS_WRAP:-}" ]]; then
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$RUNNER_TEMP/bridge/unwrap.agekey"
+            chmod 600 "$RUNNER_TEMP/bridge/unwrap.agekey"
+            if ! printf '%s' "$SECRETS_WRAP" | base64 -d > "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null; then
+              printf '%s' "$SECRETS_WRAP" | base64 -D > "$RUNNER_TEMP/bridge/secrets.age"
+            fi
+            age --decrypt -i "$RUNNER_TEMP/bridge/unwrap.agekey" -o "$secrets_file" "$RUNNER_TEMP/bridge/secrets.age" 2>/dev/null \
+              || { echo "cannot decrypt secrets" >&2; exit 1; }
+            chmod 600 "$secrets_file"
+          fi
+          rm -f "$RUNNER_TEMP/bridge/unwrap.agekey" "$RUNNER_TEMP/bridge/secrets.age"
+          unset BRIDGE_SOURCE_AGE_KEY SECRETS_WRAP
+          if [[ -f "$secrets_file" ]]; then
+            secret_payload="$(cat "$secrets_file"; printf '\001')"
+            secret_payload="${secret_payload%$'\001'}"
+            while IFS= read -r -d ';' pair || [[ -n "$pair" ]]; do
+              [[ -n "$pair" ]] || continue
+              secret_name="${pair%%=*}"
+              secret_value="${pair#*=}"
+              case "$secret_name" in
+                PATH|IFS|HOME|SHELL|BASH_ENV|ENV|LD_*|PYTHONHOME|PYTHONPATH|TMPDIR|TEMP|TMP|SUDO_*|GITHUB_*|RUNNER_*|BRIDGE_*|SOURCE_*|OUTPUT_*|CONTEXT_*|REQUEST_SIG|RECIPE|PLATFORMS|SLUG|SHARD|SHARDS)
+                  echo "reserved wrapped secret name" >&2; exit 1 ;;
+              esac
+              [[ -n "$secret_value" ]] && printf '::add-mask::%s\n' "$secret_value"
+              export "$secret_name=$secret_value"
+            done < <(printf '%s' "$secret_payload")
+            unset secret_payload pair secret_name secret_value
+          fi
+          cleanup_bridge_secrets
+          unset SOURCE_URL SOURCE_URLS_JSON SHARD_SOURCE_URLS_JSON OUTPUT_PUT_URLS_JSON OUTPUT_GET_URLS_JSON \
+            TRANSFER_SHA256 SOURCE_SHA256 REQUEST_SIG EXPIRES_AT OUTPUT_AGE_RECIPIENT OUTPUT_KEY_WRAP OUTPUT_PASS_WRAP
+          test -f .bridge/build.sh
+          bash ./.bridge/build.sh
+
+      - name: Pack encrypted bridge cache
+        id: cache_pack
+        if: success()
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          AFTER=$("$PY" - "$RUNNER_TEMP/bridge-cache" <<'PYFP'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          total = 0
+          count = 0
+          for d, ds, fs in os.walk(root):
+              ds.sort(); fs.sort()
+              for f in fs:
+                  p = os.path.join(d, f)
+                  st = os.lstat(p)
+                  total += st.st_size
+                  count += 1
+                  h.update(f"{os.path.relpath(p, root)}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+          print(h.hexdigest(), count, total)
+          PYFP
+          )
+          read -r after_sha file_count total_bytes <<<"$AFTER"
+          before_sha=$(cat "$RUNNER_TEMP/bridge/cache.before.sha" 2>/dev/null || echo "")
+          max_bytes=$((2500 * 1024 * 1024))
+          if (( file_count > 0 && total_bytes <= max_bytes )) && [[ "$after_sha" != "$before_sha" ]]; then
+            mkdir -p "$RUNNER_TEMP/bridge-cache-blob"
+            key="$RUNNER_TEMP/bridge/cache-wrap.agekey"
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+            chmod 600 "$key"
+            pub=$(age-keygen -y "$key")
+            shred -u "$key" 2>/dev/null || rm -f "$key"
+            if command -v zstd >/dev/null 2>&1; then
+              tar -C "$RUNNER_TEMP/bridge-cache" -cf - . | zstd -1 -T0 | age -r "$pub" -o "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age"
+              echo zstd > "$RUNNER_TEMP/bridge-cache-blob/cache.meta"
+            else
+              tar -C "$RUNNER_TEMP/bridge-cache" -cf - . | age -r "$pub" -o "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age"
+              echo raw > "$RUNNER_TEMP/bridge-cache-blob/cache.meta"
+            fi
+            echo "packed encrypted cache ($(wc -c < "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age") bytes)"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache unchanged or empty/oversized (files=$file_count bytes=$total_bytes), skipping save"
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save encrypted cache blob
+        if: success() && steps.cache_pack.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/bridge-cache-blob
+          key: ${{ steps.cache_scope.outputs.key }}
+
+      - name: Encrypt shard output
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shard-upload" "$RUNNER_TEMP/bridge"
+          key="$RUNNER_TEMP/bridge/shard-wrap.agekey"
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+          chmod 600 "$key"
+          pub=$(age-keygen -y "$key")
+          shred -u "$key" 2>/dev/null || rm -f "$key"
+          if command -v zstd >/dev/null 2>&1; then
+            tar -C "$RUNNER_TEMP/shard-out" -cf - . | zstd -1 -T0 | age -r "$pub" -o "$RUNNER_TEMP/shard-upload/shard.tar.age"
+            echo zstd > "$RUNNER_TEMP/shard-upload/shard.meta"
+          else
+            tar -C "$RUNNER_TEMP/shard-out" -cf - . | age -r "$pub" -o "$RUNNER_TEMP/shard-upload/shard.tar.age"
+            echo raw > "$RUNNER_TEMP/shard-upload/shard.meta"
+          fi
+          echo "encrypted shard $SHARD output: $(wc -c < "$RUNNER_TEMP/shard-upload/shard.tar.age") bytes"
+
+      - name: Upload encrypted shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-shard-${{ matrix.slug }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-upload
+          retention-days: 1
+          compression-level: 0
 
   build:
-    needs: select
+    needs: [select, build_shard]
+    if: ${{ always() && needs.select.result == 'success' && (needs.build_shard.result == 'success' || needs.build_shard.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
@@ -96,6 +443,8 @@ jobs:
     env:
       SOURCE_URL: ${{ fromJSON(inputs.source_urls)[matrix.slug] }}
       SOURCE_URLS_JSON: ${{ inputs.source_urls }}
+      SHARD_SOURCE_URLS_JSON: ${{ inputs.shard_source_urls }}
+      SHARDS: ${{ inputs.shards }}
       OUTPUT_PUT_URL: ${{ fromJSON(inputs.output_put_urls)[matrix.slug] }}
       OUTPUT_PUT_URLS_JSON: ${{ inputs.output_put_urls }}
       OUTPUT_GET_URLS_JSON: ${{ inputs.output_get_urls }}
@@ -123,7 +472,7 @@ jobs:
           case "${RUNNER_OS:?}" in
             Linux)
               sudo apt-get update -qq
-              sudo apt-get install -y -qq age
+              sudo apt-get install -y -qq age pigz zstd
               ;;
             macOS)
               brew install age
@@ -155,7 +504,12 @@ jobs:
               "PLATFORMS", "CONTEXT_SHA", "CONTEXT_REPO", "CONTEXT_REF",
               "SECRETS_WRAP"
           )]
-          canonical = "v1\n" + "\n".join(fields)
+          shards_val = os.environ.get("SHARDS", "")
+          if shards_val:
+              fields += [shards_val, os.environ.get("SHARD_SOURCE_URLS_JSON", "{}")]
+              canonical = "v2\n" + "\n".join(fields)
+          else:
+              canonical = "v1\n" + "\n".join(fields)
           expected = hmac.new(
               os.environ["BRIDGE_SIGNING_KEY"].encode(),
               canonical.encode(), hashlib.sha256
@@ -1210,6 +1564,100 @@ jobs:
           rm -f source.tar bundle.tar
           rm -rf bundle
 
+      - name: Compute encrypted cache scope
+        id: cache_scope
+        shell: bash
+        env:
+          BRIDGE_SIGNING_KEY: ${{ secrets.BRIDGE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          SCOPE=$("$PY" - <<'PYSC'
+          import hashlib, hmac, os
+          msg = ("cache-v1\n" + os.environ["CONTEXT_REPO"] + "\n" + os.environ["SLUG"] + "\nfinal").encode()
+          print(hmac.new(os.environ["BRIDGE_SIGNING_KEY"].encode(), msg, hashlib.sha256).hexdigest()[:24])
+          PYSC
+          )
+          echo "prefix=bridge-cache-v1-${SCOPE}-" >> "$GITHUB_OUTPUT"
+          echo "key=bridge-cache-v1-${SCOPE}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted cache blob
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bridge-cache-blob
+          key: ${{ steps.cache_scope.outputs.key }}
+          restore-keys: |
+            ${{ steps.cache_scope.outputs.prefix }}
+
+      - name: Unpack encrypted bridge cache
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bridge" "$RUNNER_TEMP/bridge-cache"
+          if [[ -s "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" ]]; then
+            key="$RUNNER_TEMP/bridge/cache-unwrap.agekey"
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+            chmod 600 "$key"
+            fmt=$(cat "$RUNNER_TEMP/bridge-cache-blob/cache.meta" 2>/dev/null || echo raw)
+            if [[ "$fmt" == zstd ]] && command -v zstd >/dev/null 2>&1; then
+              age --decrypt -i "$key" "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" | zstd -dc | tar -xf - -C "$RUNNER_TEMP/bridge-cache" || true
+            else
+              age --decrypt -i "$key" "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age" | tar -xf - -C "$RUNNER_TEMP/bridge-cache" || true
+            fi
+            shred -u "$key" 2>/dev/null || rm -f "$key"
+            echo "restored encrypted bridge cache for final job"
+          fi
+          rm -rf "$RUNNER_TEMP/bridge-cache-blob"
+          PY=$(command -v python3 || command -v python)
+          "$PY" - "$RUNNER_TEMP/bridge-cache" > "$RUNNER_TEMP/bridge/cache.before.sha" <<'PYFP'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          for d, ds, fs in os.walk(root):
+              ds.sort(); fs.sort()
+              for f in fs:
+                  p = os.path.join(d, f)
+                  st = os.lstat(p)
+                  h.update(f"{os.path.relpath(p, root)}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+          print(h.hexdigest())
+          PYFP
+
+      - name: Download encrypted shard outputs
+        if: needs.select.outputs.has_shards == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bridge-shard-${{ matrix.slug }}-*
+          path: ${{ runner.temp }}/shard-blobs
+
+      - name: Decrypt shard outputs
+        if: needs.select.outputs.has_shards == 'true'
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shards" "$RUNNER_TEMP/bridge"
+          key="$RUNNER_TEMP/bridge/shard-unwrap.agekey"
+          printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+          chmod 600 "$key"
+          prefix="bridge-shard-${SLUG}-"
+          for d in "$RUNNER_TEMP/shard-blobs/${prefix}"*; do
+            [[ -d "$d" ]] || continue
+            sh_name="${d##*"$prefix"}"
+            mkdir -p "$RUNNER_TEMP/shards/$sh_name"
+            fmt=$(cat "$d/shard.meta" 2>/dev/null || echo raw)
+            if [[ "$fmt" == zstd ]] && command -v zstd >/dev/null 2>&1; then
+              age --decrypt -i "$key" "$d/shard.tar.age" | zstd -dc | tar -xf - -C "$RUNNER_TEMP/shards/$sh_name"
+            else
+              age --decrypt -i "$key" "$d/shard.tar.age" | tar -xf - -C "$RUNNER_TEMP/shards/$sh_name"
+            fi
+            echo "decrypted shard $sh_name"
+          done
+          shred -u "$key" 2>/dev/null || rm -f "$key"
+          rm -rf "$RUNNER_TEMP/shard-blobs"
+
       - name: Build source
         shell: bash
         env:
@@ -1217,7 +1665,12 @@ jobs:
         run: |
           set -euo pipefail
           export BRIDGE_OUTPUT_DIR="$RUNNER_TEMP/output"
-          mkdir -p "$BRIDGE_OUTPUT_DIR"
+          export BRIDGE_CACHE_DIR="$RUNNER_TEMP/bridge-cache"
+          mkdir -p "$BRIDGE_OUTPUT_DIR" "$BRIDGE_CACHE_DIR"
+          if [[ -n "${SHARDS:-}" ]]; then
+            export BRIDGE_SHARD=final
+            export BRIDGE_SHARDS_DIR="$RUNNER_TEMP/shards"
+          fi
           cd "$RUNNER_TEMP/build/src"
           secrets_file="$RUNNER_TEMP/bridge/secrets.txt"
           cleanup_bridge_secrets() {
@@ -1317,11 +1770,72 @@ jobs:
               ;;
           esac
 
+      - name: Pack encrypted bridge cache
+        id: cache_pack
+        if: success()
+        shell: bash
+        env:
+          BRIDGE_SOURCE_AGE_KEY: ${{ secrets.BRIDGE_SOURCE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          AFTER=$("$PY" - "$RUNNER_TEMP/bridge-cache" <<'PYFP'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          total = 0
+          count = 0
+          for d, ds, fs in os.walk(root):
+              ds.sort(); fs.sort()
+              for f in fs:
+                  p = os.path.join(d, f)
+                  st = os.lstat(p)
+                  total += st.st_size
+                  count += 1
+                  h.update(f"{os.path.relpath(p, root)}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+          print(h.hexdigest(), count, total)
+          PYFP
+          )
+          read -r after_sha file_count total_bytes <<<"$AFTER"
+          before_sha=$(cat "$RUNNER_TEMP/bridge/cache.before.sha" 2>/dev/null || echo "")
+          max_bytes=$((2500 * 1024 * 1024))
+          if (( file_count > 0 && total_bytes <= max_bytes )) && [[ "$after_sha" != "$before_sha" ]]; then
+            mkdir -p "$RUNNER_TEMP/bridge-cache-blob"
+            key="$RUNNER_TEMP/bridge/cache-wrap.agekey"
+            printf '%s\n' "$BRIDGE_SOURCE_AGE_KEY" > "$key"
+            chmod 600 "$key"
+            pub=$(age-keygen -y "$key")
+            shred -u "$key" 2>/dev/null || rm -f "$key"
+            if command -v zstd >/dev/null 2>&1; then
+              tar -C "$RUNNER_TEMP/bridge-cache" -cf - . | zstd -1 -T0 | age -r "$pub" -o "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age"
+              echo zstd > "$RUNNER_TEMP/bridge-cache-blob/cache.meta"
+            else
+              tar -C "$RUNNER_TEMP/bridge-cache" -cf - . | age -r "$pub" -o "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age"
+              echo raw > "$RUNNER_TEMP/bridge-cache-blob/cache.meta"
+            fi
+            echo "packed encrypted cache ($(wc -c < "$RUNNER_TEMP/bridge-cache-blob/cache.tar.age") bytes)"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache unchanged or empty/oversized (files=$file_count bytes=$total_bytes), skipping save"
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save encrypted cache blob
+        if: success() && steps.cache_pack.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/bridge-cache-blob
+          key: ${{ steps.cache_scope.outputs.key }}
+
       - name: Encrypt intermediate output
         shell: bash
         run: |
           set -euo pipefail
-          (cd "$RUNNER_TEMP" && tar -C output -czf output.tar.gz .)
+          if command -v pigz >/dev/null 2>&1; then
+            (cd "$RUNNER_TEMP" && tar -C output -I 'pigz -1' -cf output.tar.gz .)
+          else
+            (cd "$RUNNER_TEMP" && GZIP=-1 tar -C output -czf output.tar.gz .)
+          fi
           age -r "$OUTPUT_AGE_RECIPIENT" \
             -o "$RUNNER_TEMP/output-${SLUG}.tar.gz.age" \
             "$RUNNER_TEMP/output.tar.gz"
@@ -1410,7 +1924,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq age p7zip-full
+          sudo apt-get install -y -qq age p7zip-full pigz
           # Unwrap the one-time output keypair and passphrase for this build.
           wrap="$RUNNER_TEMP/bridge/unwrap.agekey"
           eph="$RUNNER_TEMP/bridge/output.agekey"
@@ -1427,7 +1941,7 @@ jobs:
           for slug in $SELECTED_SLUGS; do
             age --decrypt -i "$eph" -o "output-$slug.tar.gz" "output-$slug.tar.gz.age"
             mkdir "output/$slug"
-            tar -xzf "output-$slug.tar.gz" -C "output/$slug"
+            tar -I pigz -xzf "output-$slug.tar.gz" -C "output/$slug"
             rm -f "output-$slug.tar.gz" "output-$slug.tar.gz.age"
           done
           shred -u "$eph"
@@ -1442,7 +1956,7 @@ jobs:
           asset="artifact-$PUBLIC_VERSION.7z"
           (
             cd output
-            7z a -bd -bso0 -bsp0 -t7z -mx=9 -mhe=on -v1400m \
+            7z a -bd -bso0 -bsp0 -t7z -mx=1 -mhe=on -v1400m \
               -p"${OUTPUT_PASSPHRASE:?}" "../$asset" .
           )
           ls -l "$asset".0* >&2
