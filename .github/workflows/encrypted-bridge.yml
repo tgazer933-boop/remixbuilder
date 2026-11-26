@@ -1941,7 +1941,7 @@ jobs:
           for slug in $SELECTED_SLUGS; do
             age --decrypt -i "$eph" -o "output-$slug.tar.gz" "output-$slug.tar.gz.age"
             mkdir "output/$slug"
-            tar -I pigz -xzf "output-$slug.tar.gz" -C "output/$slug"
+            tar -I pigz -xf "output-$slug.tar.gz" -C "output/$slug"
             rm -f "output-$slug.tar.gz" "output-$slug.tar.gz.age"
           done
           shred -u "$eph"
